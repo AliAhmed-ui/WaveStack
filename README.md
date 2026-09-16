@@ -31,7 +31,7 @@ local MP3 collection, styled like it's 1996.
 - Ubuntu 26.04 (or any modern Linux desktop running GNOME/KDE)
 - Python 3.8+
 - VLC (`libvlc`) -> the audio engine
-- Tkinter (`python3-tk`) —> the GUI toolkit
+- Tkinter (`python3-tk`) -> the GUI toolkit
 
 ## Quick Start
 
