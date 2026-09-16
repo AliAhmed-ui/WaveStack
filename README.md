@@ -159,5 +159,5 @@ right folder without editing any code.
 ## Privacy
 
 WaveStack makes zero network requests. No lyrics, no album art
-downloads, no update checks, no analytics — everything it does happens
+downloads, no update checks, no analytics,everything it does happens
 against your local filesystem and your local audio device.
