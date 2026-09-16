@@ -10,28 +10,28 @@ local MP3 collection, styled like it's 1996.
 
 ## Features
 
-- **Strict retro aesthetic** — thick raised/sunken borders, classic
+- **Strict retro aesthetic** thick raised/sunken borders, classic
   gray (`#C0C0C0`) chrome, monospace fonts, and a scrolling green LCD
   "now playing" marquee, all built from classic Tkinter widgets (not a
   themed skin, so it doesn't inherit your desktop's modern GTK/Qt look)
-- **Full playback controls** — Play, Pause, Stop, Next, Previous
-- **Library + Queue** — browse your music folder, multi-select tracks
+- **Full playback controls**  Play, Pause, Stop, Next, Previous
+- **Library + Queue**  browse your music folder, multi-select tracks
   to enqueue, remove from the queue, right-click context menus
-- **Working seek bar** — drag to scrub through a track, powered by
+- **Working seek bar**  drag to scrub through a track, powered by
   libVLC for reliable seeking, including on variable-bitrate MP3s
 - **Volume slider**
-- **Open Folder** — load music from anywhere, not just the default
+- **Open Folder**  load music from anywhere, not just the default
   directory
-- **100% offline** — zero network calls, ever
-- **Won't crash on bad input** — missing/empty folders and corrupted
+- **100% offline**  zero network calls, ever
+- **Won't crash on bad input**  missing/empty folders and corrupted
   files are handled with retro-styled dialogs, not stack traces
 
 ## Requirements
 
 - Ubuntu 26.04 (or any modern Linux desktop running GNOME/KDE)
 - Python 3.8+
-- VLC (`libvlc`) — the audio engine
-- Tkinter (`python3-tk`) — the GUI toolkit
+- VLC (`libvlc`) -> the audio engine
+- Tkinter (`python3-tk`) —> the GUI toolkit
 
 ## Quick Start
 
@@ -82,8 +82,8 @@ what each one does and how to undo it.
 
 ### Keyboard shortcuts
 
-- `Ctrl+O` — Open Folder
-- `Ctrl+Q` — Quit
+- `Ctrl+O` = Open Folder
+- `Ctrl+Q` = Quit
 
 ## Configuration
 
