@@ -1,6 +1,6 @@
 # WaveStack
 
-A fully offline, 1990s-styled MP3 player for Linux desktops — built with
+A fully offline, 1990s-styled MP3 player for Linux desktops, built with
 Python, Tkinter, and libVLC.
 
 No lyrics fetching. No album art scraping. No telemetry. Just your
