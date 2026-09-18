@@ -59,17 +59,89 @@ STATE_FILE = os.path.expanduser("~/.config/wavestack/state.json")
 AUTOSAVE_INTERVAL_SECONDS = 5
 
 # --------------------------------------------------------------------------
-# Retro color palette (classic Windows 95 / Motif style)
+# Retro color palettes (Light = Classic Windows 95 / Motif; Dark = Retro Noir)
 # --------------------------------------------------------------------------
 
-BG = "#C0C0C0"              # standard "button face" gray
-BG_LIGHT = "#E0E0E0"         # lighter gray, used for hover/active states
-BORDER_BLACK = "#000000"
-TITLE_BLUE = "#000080"       # classic navy blue
-SELECT_BG = "#000080"
-SELECT_FG = "#FFFFFF"
-LCD_BG = "#0A1F0A"           # dark green-black LCD panel background
-LCD_FG = "#39FF14"           # bright LCD green
+THEMES = {
+    "light": {
+        "name": "light",
+        "bg": "#C0C0C0",              # standard "button face" gray
+        "bg_light": "#E0E0E0",        # lighter gray, used for hover/active states
+        "fg": "#000000",              # standard black text
+        "title_fg": "#000080",        # classic navy blue
+        "border_black": "#000000",
+        "select_bg": "#000080",
+        "select_fg": "#FFFFFF",
+        "lcd_bg": "#0A1F0A",          # dark green-black LCD panel background
+        "lcd_fg": "#39FF14",          # bright LCD green
+        "entry_bg": "#FFFFFF",        # white input/listbox backgrounds
+        "entry_fg": "#000000",
+        "entry_insert": "#000000",
+        "search_placeholder_fg": "#777777",
+        "search_normal_fg": "#000000",
+        "scale_trough": "#FFFFFF",
+        "btn_bg": "#C0C0C0",
+        "btn_fg": "#000000",
+        "btn_active_bg": "#E0E0E0",
+        "btn_active_fg": "#000000",
+        "menu_bg": "#C0C0C0",
+        "menu_fg": "#000000",
+        "menu_active_bg": "#000080",
+        "menu_active_fg": "#FFFFFF",
+    },
+    "dark": {
+        "name": "dark",
+        "bg": "#242424",              # chunky dark chassis gray (preserves Tk 3D bevels)
+        "bg_light": "#383838",        # lighter dark gray for active states
+        "fg": "#E0E0E0",              # soft light silver text
+        "title_fg": "#00E5FF",        # electric retro cyan
+        "border_black": "#0F0F0F",
+        "select_bg": "#005599",        # deep navy blue selection
+        "select_fg": "#FFFFFF",
+        "lcd_bg": "#0A1F0A",          # authentic green phosphor LCD remains iconic
+        "lcd_fg": "#39FF14",
+        "entry_bg": "#141414",        # sunken dark well for lists & inputs
+        "entry_fg": "#E0E0E0",
+        "entry_insert": "#FFFFFF",
+        "search_placeholder_fg": "#888888",
+        "search_normal_fg": "#E0E0E0",
+        "scale_trough": "#141414",    # sunken dark slider track
+        "btn_bg": "#303030",          # 3D raised dark buttons
+        "btn_fg": "#E0E0E0",
+        "btn_active_bg": "#444444",
+        "btn_active_fg": "#FFFFFF",
+        "menu_bg": "#282828",
+        "menu_fg": "#E0E0E0",
+        "menu_active_bg": "#005599",
+        "menu_active_fg": "#FFFFFF",
+    }
+}
+
+DEFAULT_THEME = "light"
+
+# Backward-compatibility alias constants (referencing default light theme)
+BG = THEMES["light"]["bg"]
+BG_LIGHT = THEMES["light"]["bg_light"]
+BORDER_BLACK = THEMES["light"]["border_black"]
+TITLE_BLUE = THEMES["light"]["title_fg"]
+SELECT_BG = THEMES["light"]["select_bg"]
+SELECT_FG = THEMES["light"]["select_fg"]
+LCD_BG = THEMES["light"]["lcd_bg"]
+LCD_FG = THEMES["light"]["lcd_fg"]
+
+SEARCH_PLACEHOLDER_TEXT = "search song"
+SEARCH_PLACEHOLDER_FG = THEMES["light"]["search_placeholder_fg"]
+SEARCH_NORMAL_FG = THEMES["light"]["search_normal_fg"]
+
+# Keys that change the search entry's cursor position or invoke a
+# specific search action, but don't change its text -- recomputing
+# suggestions on these would be wasted work, and for Down/Up it would
+# actively fight the dropdown navigation below.
+_SEARCH_NON_TEXT_KEYSYMS = {
+    "Down", "Up", "Return", "KP_Enter", "Escape", "Tab",
+    "Left", "Right", "Home", "End",
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+}
 
 
 # --------------------------------------------------------------------------
@@ -142,37 +214,45 @@ class RetroDialog(tk.Toplevel):
     Wayland window managers); everything below it is custom-styled."""
 
     ICON_GLYPHS = {"info": "i", "warning": "!", "error": "X"}
-    ICON_COLORS = {"info": TITLE_BLUE, "warning": "#806000", "error": "#800000"}
 
-    def __init__(self, parent, title, message, kind="info", buttons=None):
+    def __init__(self, parent, title, message, kind="info", buttons=None, theme=None):
         super().__init__(parent)
-        self.configure(bg=BG)
+        if theme is None:
+            theme = getattr(parent, "theme", None) or THEMES[DEFAULT_THEME]
+        self.theme = theme
+
+        self.configure(bg=theme["bg"])
         self.resizable(False, False)
         self.title(title)
         self.transient(parent)
         self.result = None
 
-        outer = tk.Frame(self, bg=BG, bd=2, relief=tk.RAISED)
+        outer = tk.Frame(self, bg=theme["bg"], bd=2, relief=tk.RAISED)
         outer.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
-        content = tk.Frame(outer, bg=BG)
+        content = tk.Frame(outer, bg=theme["bg"])
         content.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
 
         icon_glyph = self.ICON_GLYPHS.get(kind, "i")
-        icon_color = self.ICON_COLORS.get(kind, "black")
-        icon_frame = tk.Frame(content, bg="white", bd=2, relief=tk.SUNKEN,
+        icon_color_map = {
+            "info": theme["title_fg"],
+            "warning": "#C89600" if theme["name"] == "dark" else "#806000",
+            "error": "#FF4D4D" if theme["name"] == "dark" else "#800000"
+        }
+        icon_color = icon_color_map.get(kind, theme["fg"])
+        icon_frame = tk.Frame(content, bg=theme["entry_bg"], bd=2, relief=tk.SUNKEN,
                                width=36, height=36)
         icon_frame.grid(row=0, column=0, padx=(0, 14), sticky="n")
         icon_frame.grid_propagate(False)
-        tk.Label(icon_frame, text=icon_glyph, bg="white", fg=icon_color,
+        tk.Label(icon_frame, text=icon_glyph, bg=theme["entry_bg"], fg=icon_color,
                  font=get_retro_font(self, 16, bold=True)).place(
             relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(content, text=message, bg=BG, fg="black", justify=tk.LEFT,
+        tk.Label(content, text=message, bg=theme["bg"], fg=theme["fg"], justify=tk.LEFT,
                  wraplength=320, font=get_retro_font(self, 9)).grid(
             row=0, column=1, sticky="w")
 
-        button_row = tk.Frame(outer, bg=BG)
+        button_row = tk.Frame(outer, bg=theme["bg"])
         button_row.pack(fill=tk.X, padx=14, pady=(0, 14))
 
         if buttons is None:
@@ -181,8 +261,10 @@ class RetroDialog(tk.Toplevel):
         for label, value in buttons:
             tk.Button(
                 button_row, text=label, width=11,
-                font=get_retro_font(self, 9), bg=BG, relief=tk.RAISED,
-                bd=3, activebackground=BG_LIGHT,
+                font=get_retro_font(self, 9), bg=theme["btn_bg"], fg=theme["btn_fg"],
+                relief=tk.RAISED, bd=3,
+                activebackground=theme["btn_active_bg"],
+                activeforeground=theme["btn_active_fg"],
                 command=lambda v=value: self._finish(v),
             ).pack(side=tk.RIGHT, padx=(6, 0))
 
@@ -258,6 +340,11 @@ class NowPlayingDisplay(tk.Frame):
         if self.x < -text_width:
             self.x = canvas_width
         self.canvas.coords(self.text_id, self.x, 16)
+
+    def apply_theme(self, theme):
+        self.configure(bg=theme.get("border_black", BORDER_BLACK))
+        self.canvas.configure(bg=theme.get("lcd_bg", LCD_BG))
+        self.canvas.itemconfigure(self.text_id, fill=theme.get("lcd_fg", LCD_FG))
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +429,16 @@ class WaveStackApp(tk.Tk):
     def __init__(self):
         super().__init__(className="WaveStack")
         self.title(APP_TITLE)
-        self.configure(bg=BG)
+
+        # Theme initialization (restores theme if previously saved in state.json)
+        saved_state = self._load_state_file()
+        if saved_state and saved_state.get("theme") in THEMES:
+            self.current_theme_name = saved_state["theme"]
+        else:
+            self.current_theme_name = DEFAULT_THEME
+        self.theme = THEMES[self.current_theme_name]
+        self.current_theme = self.theme
+        self.configure(bg=self.theme["bg"])
         self.geometry("860x580")
         self.minsize(720, 480)
 
@@ -374,6 +470,11 @@ class WaveStackApp(tk.Tk):
         self._pending_resume_ticks = 0
         self._last_autosave = 0.0
 
+        # Search-suggestions dropdown state: the list of full file
+        # paths currently shown in the dropdown, in display order, so
+        # a click or Enter can map a row straight back to a path.
+        self._current_suggestions = []
+
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="00:00")
         self.total_var = tk.StringVar(value="00:00")
@@ -404,20 +505,37 @@ class WaveStackApp(tk.Tk):
     # -- construction --------------------------------------------------
 
     def _build_menu(self):
-        menubar = tk.Menu(self, bg=BG, fg="black", font=self.font_normal,
-                           tearoff=0)
+        t = self.theme
+        self.menubar = tk.Menu(self, bg=t["menu_bg"], fg=t["menu_fg"],
+                               activebackground=t["menu_active_bg"],
+                               activeforeground=t["menu_active_fg"],
+                               font=self.font_normal, tearoff=0)
 
-        file_menu = tk.Menu(menubar, tearoff=0, bg=BG, font=self.font_normal)
-        file_menu.add_command(label="Open Folder...",
+        self.file_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+                                 fg=t["menu_fg"],
+                                 activebackground=t["menu_active_bg"],
+                                 activeforeground=t["menu_active_fg"],
+                                 font=self.font_normal)
+        self.file_menu.add_command(label="Open Folder...",
                                command=self.on_open_folder,
                                accelerator="Ctrl+O")
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.on_close,
+        self.file_menu.add_command(label="Find in Library...",
+                               command=self._on_focus_search_shortcut,
+                               accelerator="Ctrl+F")
+        self.file_menu.add_command(label="Toggle Dark/Light Mode",
+                               command=self.toggle_theme,
+                               accelerator="F10")
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.on_close,
                                accelerator="Ctrl+Q")
-        menubar.add_cascade(label="File", menu=file_menu)
+        self.menubar.add_cascade(label="File", menu=self.file_menu)
 
-        playback_menu = tk.Menu(menubar, tearoff=0, bg=BG,
-                                 font=self.font_normal)
+        self.playback_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+                                     fg=t["menu_fg"],
+                                     activebackground=t["menu_active_bg"],
+                                     activeforeground=t["menu_active_fg"],
+                                     font=self.font_normal)
+        playback_menu = self.playback_menu
         playback_menu.add_command(label="Play", command=self.on_play_clicked,
                                    accelerator="Space")
         playback_menu.add_command(label="Pause",
@@ -428,18 +546,27 @@ class WaveStackApp(tk.Tk):
         playback_menu.add_command(label="Next", command=self.on_next_clicked)
         playback_menu.add_command(label="Previous",
                                    command=self.on_prev_clicked)
-        menubar.add_cascade(label="Playback", menu=playback_menu)
+        self.menubar.add_cascade(label="Playback", menu=playback_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=0, bg=BG, font=self.font_normal)
-        help_menu.add_command(label="About WaveStack...",
+        self.help_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+                                 fg=t["menu_fg"],
+                                 activebackground=t["menu_active_bg"],
+                                 activeforeground=t["menu_active_fg"],
+                                 font=self.font_normal)
+        self.help_menu.add_command(label="Toggle Dark/Light Mode",
+                               command=self.toggle_theme)
+        self.help_menu.add_separator()
+        self.help_menu.add_command(label="About WaveStack...",
                                command=self.show_about)
-        menubar.add_cascade(label="Help", menu=help_menu)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
 
-        self.config(menu=menubar)
+        self.config(menu=self.menubar)
 
     def _bind_shortcuts(self):
         self.bind_all("<Control-o>", lambda e: self.on_open_folder())
         self.bind_all("<Control-q>", lambda e: self.on_close())
+        self.bind_all("<Control-f>", self._on_focus_search_shortcut)
+        self.bind_all("<F10>", lambda e: self.toggle_theme())
 
         # Space = play/pause, everywhere. Button and Listbox both ship
         # with their OWN default <space> binding (invoke a focused
@@ -454,155 +581,430 @@ class WaveStackApp(tk.Tk):
         self.bind_all("<space>", self._on_spacebar)
 
     def _build_widgets(self):
-        outer = tk.Frame(self, bg=BG, bd=2, relief=tk.RIDGE)
-        outer.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        t = self.theme
+        self.outer_frame = tk.Frame(self, bg=t["bg"], bd=2, relief=tk.RIDGE)
+        self.outer_frame.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
         # Header banner
-        header = tk.Frame(outer, bg=BG, bd=2, relief=tk.RAISED)
-        header.pack(fill=tk.X, padx=4, pady=(4, 2))
-        tk.Label(header, text="W A V E S T A C K", bg=BG, fg=TITLE_BLUE,
-                 font=self.font_title).pack(side=tk.LEFT, padx=10, pady=6)
-        tk.Label(header, text="100% Offline MP3 Player", bg=BG, fg="black",
-                 font=self.font_normal).pack(side=tk.RIGHT, padx=10)
+        self.header_frame = tk.Frame(self.outer_frame, bg=t["bg"], bd=2, relief=tk.RAISED)
+        self.header_frame.pack(fill=tk.X, padx=4, pady=(4, 2))
+        self.title_label = tk.Label(self.header_frame, text="W A V E S T A C K",
+                                    bg=t["bg"], fg=t["title_fg"],
+                                    font=self.font_title)
+        self.title_label.pack(side=tk.LEFT, padx=10, pady=6)
+
+        # Theme toggle button in top right corner
+        theme_icon = "☀" if self.current_theme_name == "light" else "🌙"
+        self.theme_btn = tk.Button(
+            self.header_frame, text=theme_icon,
+            command=self.toggle_theme,
+            font=get_retro_font(self, 12, bold=True),
+            bg=t["btn_bg"], fg=t["btn_fg"],
+            relief=tk.RAISED, bd=3,
+            activebackground=t["btn_active_bg"],
+            activeforeground=t["btn_active_fg"],
+            padx=5, pady=0, cursor="hand2"
+        )
+        self.theme_btn.pack(side=tk.RIGHT, padx=(4, 8), pady=4)
+        self.theme_btn.bind("<Enter>", lambda e: self._on_theme_btn_hover(True))
+        self.theme_btn.bind("<Leave>", lambda e: self._on_theme_btn_hover(False))
+
+        self.subtitle_label = tk.Label(self.header_frame, text="100% Offline MP3 Player",
+                                       bg=t["bg"], fg=t["fg"],
+                                       font=self.font_normal)
+        self.subtitle_label.pack(side=tk.RIGHT, padx=10)
 
         # Now playing LCD marquee
-        self.now_playing_display = NowPlayingDisplay(outer)
+        self.now_playing_display = NowPlayingDisplay(self.outer_frame)
+        self.now_playing_display.apply_theme(t)
         self.now_playing_display.pack(fill=tk.X, padx=6, pady=6)
 
         # Transport controls
-        transport = tk.Frame(outer, bg=BG)
-        transport.pack(fill=tk.X, padx=6, pady=2)
+        self.transport_frame = tk.Frame(self.outer_frame, bg=t["bg"])
+        self.transport_frame.pack(fill=tk.X, padx=6, pady=2)
 
         def make_button(parent, text, command):
             return tk.Button(parent, text=text, command=command,
-                              font=self.font_bold, bg=BG, relief=tk.RAISED,
-                              bd=3, activebackground=BG_LIGHT, padx=6)
+                              font=self.font_bold, bg=t["btn_bg"], fg=t["btn_fg"],
+                              relief=tk.RAISED, bd=3,
+                              activebackground=t["btn_active_bg"],
+                              activeforeground=t["btn_active_fg"],
+                              padx=6)
 
-        self.prev_btn = make_button(transport, "\u25c4\u25c4 Prev",
+        self.prev_btn = make_button(self.transport_frame, "\u25c4\u25c4 Prev",
                                      self.on_prev_clicked)
-        self.play_btn = make_button(transport, "\u25ba Play",
+        self.play_btn = make_button(self.transport_frame, "\u25ba Play",
                                      self.on_play_clicked)
-        self.pause_btn = make_button(transport, "|| Pause",
+        self.pause_btn = make_button(self.transport_frame, "|| Pause",
                                       self.on_pause_clicked)
-        self.stop_btn = make_button(transport, "\u25a0 Stop",
+        self.stop_btn = make_button(self.transport_frame, "\u25a0 Stop",
                                      self.on_stop_clicked)
-        self.next_btn = make_button(transport, "Next \u25ba\u25ba",
+        self.next_btn = make_button(self.transport_frame, "Next \u25ba\u25ba",
                                      self.on_next_clicked)
         for b in (self.prev_btn, self.play_btn, self.pause_btn,
                   self.stop_btn, self.next_btn):
             b.pack(side=tk.LEFT, padx=3, pady=3)
 
-        self.open_folder_btn = make_button(transport, "Open Folder...",
+        self.open_folder_btn = make_button(self.transport_frame, "Open Folder...",
                                             self.on_open_folder)
         self.open_folder_btn.pack(side=tk.RIGHT, padx=3, pady=3)
 
         # Seek bar
-        seek_frame = tk.Frame(outer, bg=BG)
-        seek_frame.pack(fill=tk.X, padx=6, pady=(6, 2))
-        tk.Label(seek_frame, textvariable=self.elapsed_var, bg=BG,
-                 font=self.font_normal, width=6).pack(side=tk.LEFT)
+        self.seek_frame = tk.Frame(self.outer_frame, bg=t["bg"])
+        self.seek_frame.pack(fill=tk.X, padx=6, pady=(6, 2))
+        self.elapsed_label = tk.Label(self.seek_frame, textvariable=self.elapsed_var,
+                                      bg=t["bg"], fg=t["fg"],
+                                      font=self.font_normal, width=6)
+        self.elapsed_label.pack(side=tk.LEFT)
         self.seek_scale = tk.Scale(
-            seek_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-            showvalue=False, bg=BG, troughcolor="white", relief=tk.RAISED,
-            bd=2, sliderrelief=tk.RAISED, highlightthickness=0,
+            self.seek_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+            showvalue=False, bg=t["bg"], fg=t["fg"], troughcolor=t["scale_trough"],
+            relief=tk.RAISED, bd=2, sliderrelief=tk.RAISED, highlightthickness=0,
+            activebackground=t["btn_active_bg"],
             command=self._on_seek_scale_moved)
         self.seek_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
-        tk.Label(seek_frame, textvariable=self.total_var, bg=BG,
-                 font=self.font_normal, width=6).pack(side=tk.LEFT)
+        self.total_label = tk.Label(self.seek_frame, textvariable=self.total_var,
+                                    bg=t["bg"], fg=t["fg"],
+                                    font=self.font_normal, width=6)
+        self.total_label.pack(side=tk.LEFT)
 
         # Volume
-        vol_frame = tk.Frame(outer, bg=BG)
-        vol_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
-        tk.Label(vol_frame, text="Volume", bg=BG,
-                 font=self.font_normal).pack(side=tk.LEFT, padx=(0, 6))
+        self.vol_frame = tk.Frame(self.outer_frame, bg=t["bg"])
+        self.vol_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self.vol_label = tk.Label(self.vol_frame, text="Volume", bg=t["bg"],
+                                  fg=t["fg"], font=self.font_normal)
+        self.vol_label.pack(side=tk.LEFT, padx=(0, 6))
         self.volume_scale = tk.Scale(
-            vol_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-            showvalue=False, bg=BG, troughcolor="white", relief=tk.RAISED,
-            bd=2, sliderrelief=tk.RAISED, highlightthickness=0,
+            self.vol_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+            showvalue=False, bg=t["bg"], fg=t["fg"], troughcolor=t["scale_trough"],
+            relief=tk.RAISED, bd=2, sliderrelief=tk.RAISED, highlightthickness=0,
+            activebackground=t["btn_active_bg"],
             command=self.on_volume_changed, length=160)
         self.volume_scale.set(70)
         self.volume_scale.pack(side=tk.LEFT)
         self.audio.set_volume(70)
 
         # Library / Queue panes
-        panes = tk.Frame(outer, bg=BG)
-        panes.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-        panes.columnconfigure(0, weight=3)
-        panes.columnconfigure(1, weight=0)
-        panes.columnconfigure(2, weight=2)
-        panes.rowconfigure(0, weight=1)
+        self.panes = tk.Frame(self.outer_frame, bg=t["bg"])
+        self.panes.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        self.panes.columnconfigure(0, weight=3)
+        self.panes.columnconfigure(1, weight=0)
+        self.panes.columnconfigure(2, weight=2)
+        self.panes.rowconfigure(0, weight=1)
 
         # -- Library pane --
-        lib_frame = tk.Frame(panes, bg=BG, bd=2, relief=tk.SUNKEN)
-        lib_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        tk.Label(lib_frame, text="Library", bg=BG, font=self.font_bold,
-                 anchor="w").pack(fill=tk.X, padx=4, pady=(2, 0))
-        lib_list_frame = tk.Frame(lib_frame, bg=BG)
-        lib_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        lib_scroll = tk.Scrollbar(lib_list_frame, orient=tk.VERTICAL)
+        self.lib_frame = tk.Frame(self.panes, bg=t["bg"], bd=2, relief=tk.SUNKEN)
+        self.lib_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.lib_header_label = tk.Label(self.lib_frame, text="Library",
+                                         bg=t["bg"], fg=t["fg"],
+                                         font=self.font_bold, anchor="w")
+        self.lib_header_label.pack(fill=tk.X, padx=4, pady=(2, 0))
+
+        self.search_frame = tk.Frame(self.lib_frame, bg=t["bg"])
+        self.search_frame.pack(fill=tk.X, padx=4, pady=(2, 4))
+        self.search_entry = tk.Entry(
+            self.search_frame, font=self.font_normal, bg=t["entry_bg"],
+            fg=t["search_placeholder_fg"], relief=tk.SUNKEN, bd=2,
+            highlightthickness=0, insertbackground=t["entry_insert"])
+        self.search_entry.insert(0, SEARCH_PLACEHOLDER_TEXT)
+        self.search_entry.pack(fill=tk.X)
+        self.search_entry.bind("<KeyPress>", self._on_search_keypress)
+        self.search_entry.bind("<KeyRelease>", self._on_search_key_release)
+        self.search_entry.bind("<FocusOut>", self._on_search_focus_out)
+        self.search_entry.bind("<Return>", self._on_search_enter)
+        self.search_entry.bind("<KP_Enter>", self._on_search_enter)
+        self.search_entry.bind("<Escape>", self._on_search_escape)
+        self.search_entry.bind("<Down>", self._on_search_arrow_down)
+        self.search_entry.bind("<Up>", self._on_search_arrow_up)
+
+        # Suggestions dropdown: a plain child of the main window,
+        # positioned with .place() rather than shown as a separate
+        # Toplevel popup. A Toplevel's requested screen position is
+        # frequently ignored under Wayland (Ubuntu 26.04's default
+        # session), which would make a floating popup appear in the
+        # wrong place or not track the window at all; a placed child
+        # widget is pure internal Tk layout and has no such risk.
+        self.suggestions_frame = tk.Frame(self, bg=t["border_black"], bd=1,
+                                           relief=tk.RAISED)
+        self.suggestions_listbox = tk.Listbox(
+            self.suggestions_frame, bg=t["entry_bg"], fg=t["entry_fg"],
+            font=self.font_normal, relief=tk.FLAT, bd=0,
+            selectbackground=t["select_bg"], selectforeground=t["select_fg"],
+            activestyle="none", exportselection=False, highlightthickness=0)
+        self.suggestions_listbox.pack(fill=tk.BOTH, expand=True,
+                                       padx=1, pady=1)
+        self.suggestions_listbox.bind("<Button-1>",
+                                       self._on_suggestion_clicked)
+
+        self.lib_list_frame = tk.Frame(self.lib_frame, bg=t["bg"])
+        self.lib_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.lib_scroll = tk.Scrollbar(self.lib_list_frame, orient=tk.VERTICAL)
         self.library_listbox = tk.Listbox(
-            lib_list_frame, bg="white", fg="black", font=self.font_normal,
-            relief=tk.SUNKEN, bd=2, selectbackground=SELECT_BG,
-            selectforeground=SELECT_FG, activestyle="none",
+            self.lib_list_frame, bg=t["entry_bg"], fg=t["entry_fg"], font=self.font_normal,
+            relief=tk.SUNKEN, bd=2, selectbackground=t["select_bg"],
+            selectforeground=t["select_fg"], activestyle="none",
             selectmode=tk.EXTENDED, exportselection=False,
-            yscrollcommand=lib_scroll.set)
-        lib_scroll.config(command=self.library_listbox.yview)
+            yscrollcommand=self.lib_scroll.set)
+        self.lib_scroll.config(command=self.library_listbox.yview)
         self.library_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        lib_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.lib_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.library_listbox.bind("<Double-Button-1>",
                                    lambda e: self.on_play_clicked())
         self.library_listbox.bind("<Button-3>",
                                    self.show_library_context_menu)
 
         # -- Middle buttons --
-        mid_frame = tk.Frame(panes, bg=BG)
-        mid_frame.grid(row=0, column=1, sticky="ns", padx=4)
-        mid_inner = tk.Frame(mid_frame, bg=BG)
-        mid_inner.pack(expand=True)
-        tk.Button(mid_inner, text="Enqueue >>",
+        self.mid_frame = tk.Frame(self.panes, bg=t["bg"])
+        self.mid_frame.grid(row=0, column=1, sticky="ns", padx=4)
+        self.mid_inner = tk.Frame(self.mid_frame, bg=t["bg"])
+        self.mid_inner.pack(expand=True)
+        self.enqueue_btn = tk.Button(self.mid_inner, text="Enqueue >>",
                   command=self.on_enqueue_clicked, font=self.font_normal,
-                  bg=BG, relief=tk.RAISED, bd=3).pack(pady=6, fill=tk.X)
-        tk.Button(mid_inner, text="<< Remove",
+                  bg=t["btn_bg"], fg=t["btn_fg"], relief=tk.RAISED, bd=3,
+                  activebackground=t["btn_active_bg"],
+                  activeforeground=t["btn_active_fg"])
+        self.enqueue_btn.pack(pady=6, fill=tk.X)
+        self.remove_btn = tk.Button(self.mid_inner, text="<< Remove",
                   command=self.on_remove_from_queue_clicked,
-                  font=self.font_normal, bg=BG, relief=tk.RAISED,
-                  bd=3).pack(pady=6, fill=tk.X)
-        tk.Button(mid_inner, text="Clear Queue",
+                  font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
+                  relief=tk.RAISED, bd=3,
+                  activebackground=t["btn_active_bg"],
+                  activeforeground=t["btn_active_fg"])
+        self.remove_btn.pack(pady=6, fill=tk.X)
+        self.clear_btn = tk.Button(self.mid_inner, text="Clear Queue",
                   command=self.on_clear_queue_clicked,
-                  font=self.font_normal, bg=BG, relief=tk.RAISED,
-                  bd=3).pack(pady=6, fill=tk.X)
+                  font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
+                  relief=tk.RAISED, bd=3,
+                  activebackground=t["btn_active_bg"],
+                  activeforeground=t["btn_active_fg"])
+        self.clear_btn.pack(pady=6, fill=tk.X)
 
         # -- Queue pane --
-        queue_frame = tk.Frame(panes, bg=BG, bd=2, relief=tk.SUNKEN)
-        queue_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
-        queue_header = tk.Frame(queue_frame, bg=BG)
-        queue_header.pack(fill=tk.X, padx=4, pady=(2, 0))
-        tk.Label(queue_header, text="Queue", bg=BG, font=self.font_bold,
-                 anchor="w").pack(side=tk.LEFT)
-        tk.Label(queue_header, textvariable=self.queue_count_var, bg=BG,
-                 font=self.font_normal).pack(side=tk.RIGHT)
-        queue_list_frame = tk.Frame(queue_frame, bg=BG)
-        queue_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        queue_scroll = tk.Scrollbar(queue_list_frame, orient=tk.VERTICAL)
+        self.queue_frame = tk.Frame(self.panes, bg=t["bg"], bd=2, relief=tk.SUNKEN)
+        self.queue_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+        self.queue_header = tk.Frame(self.queue_frame, bg=t["bg"])
+        self.queue_header.pack(fill=tk.X, padx=4, pady=(2, 0))
+        self.queue_title_label = tk.Label(self.queue_header, text="Queue",
+                                          bg=t["bg"], fg=t["fg"],
+                                          font=self.font_bold, anchor="w")
+        self.queue_title_label.pack(side=tk.LEFT)
+        self.queue_count_label = tk.Label(self.queue_header, textvariable=self.queue_count_var,
+                                          bg=t["bg"], fg=t["fg"],
+                                          font=self.font_normal)
+        self.queue_count_label.pack(side=tk.RIGHT)
+        self.queue_list_frame = tk.Frame(self.queue_frame, bg=t["bg"])
+        self.queue_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.queue_scroll = tk.Scrollbar(self.queue_list_frame, orient=tk.VERTICAL)
         self.queue_listbox = tk.Listbox(
-            queue_list_frame, bg="white", fg="black", font=self.font_normal,
-            relief=tk.SUNKEN, bd=2, selectbackground=SELECT_BG,
-            selectforeground=SELECT_FG, activestyle="none",
+            self.queue_list_frame, bg=t["entry_bg"], fg=t["entry_fg"], font=self.font_normal,
+            relief=tk.SUNKEN, bd=2, selectbackground=t["select_bg"],
+            selectforeground=t["select_fg"], activestyle="none",
             selectmode=tk.EXTENDED, exportselection=False,
-            yscrollcommand=queue_scroll.set)
-        queue_scroll.config(command=self.queue_listbox.yview)
+            yscrollcommand=self.queue_scroll.set)
+        self.queue_scroll.config(command=self.queue_listbox.yview)
         self.queue_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.queue_listbox.bind("<Double-Button-1>", self.on_play_from_queue)
         self.queue_listbox.bind("<Button-3>", self.show_queue_context_menu)
 
         # Status bar
-        status_bar = tk.Frame(outer, bg=BG, bd=2, relief=tk.SUNKEN)
-        status_bar.pack(fill=tk.X, padx=4, pady=(2, 4))
-        tk.Label(status_bar, textvariable=self.status_var, bg=BG,
-                 font=self.font_normal, anchor="w").pack(
-            side=tk.LEFT, padx=6, pady=2, fill=tk.X, expand=True)
+        self.status_bar = tk.Frame(self.outer_frame, bg=t["bg"], bd=2, relief=tk.SUNKEN)
+        self.status_bar.pack(fill=tk.X, padx=4, pady=(2, 4))
+        self.status_label = tk.Label(self.status_bar, textvariable=self.status_var,
+                                     bg=t["bg"], fg=t["fg"],
+                                     font=self.font_normal, anchor="w")
+        self.status_label.pack(side=tk.LEFT, padx=6, pady=2, fill=tk.X, expand=True)
+
+    def _on_theme_btn_hover(self, entering):
+        if entering:
+            hint = "Click to toggle Dark Mode" if self.current_theme_name == "light" else "Click to toggle Light Mode"
+            self.status_var.set(hint)
+        else:
+            if self.now_playing:
+                self.status_var.set(f"Playing: {os.path.basename(self.now_playing)}")
+            else:
+                self.status_var.set("Ready")
+
+    def toggle_theme(self):
+        new_theme = "dark" if self.current_theme_name == "light" else "light"
+        self.apply_theme(new_theme)
+        self.save_state()
+        self.status_var.set(f"Theme switched to {new_theme.capitalize()} Mode")
+
+    def apply_theme(self, theme_name):
+        if theme_name not in THEMES:
+            return
+        self.current_theme_name = theme_name
+        self.theme = THEMES[theme_name]
+        self.current_theme = self.theme
+        t = self.theme
+
+        # Root window
+        self.configure(bg=t["bg"])
+
+        # Menus
+        for m in (getattr(self, "menubar", None),
+                  getattr(self, "file_menu", None),
+                  getattr(self, "playback_menu", None),
+                  getattr(self, "help_menu", None)):
+            if m:
+                try:
+                    m.configure(bg=t["menu_bg"], fg=t["menu_fg"],
+                                activebackground=t["menu_active_bg"],
+                                activeforeground=t["menu_active_fg"])
+                except Exception:
+                    pass
+
+        # Outer & Header
+        if hasattr(self, "outer_frame"):
+            self.outer_frame.configure(bg=t["bg"])
+        if hasattr(self, "header_frame"):
+            self.header_frame.configure(bg=t["bg"])
+        if hasattr(self, "title_label"):
+            self.title_label.configure(bg=t["bg"], fg=t["title_fg"])
+        if hasattr(self, "subtitle_label"):
+            self.subtitle_label.configure(bg=t["bg"], fg=t["fg"])
+
+        # Theme toggle button
+        if hasattr(self, "theme_btn"):
+            icon = "☀" if self.current_theme_name == "light" else "🌙"
+            self.theme_btn.configure(
+                text=icon,
+                bg=t["btn_bg"], fg=t["btn_fg"],
+                activebackground=t["btn_active_bg"],
+                activeforeground=t["btn_active_fg"]
+            )
+
+        # LCD marquee
+        if hasattr(self, "now_playing_display"):
+            self.now_playing_display.apply_theme(t)
+
+        # Transport
+        if hasattr(self, "transport_frame"):
+            self.transport_frame.configure(bg=t["bg"])
+        for btn in (getattr(self, "prev_btn", None),
+                    getattr(self, "play_btn", None),
+                    getattr(self, "pause_btn", None),
+                    getattr(self, "stop_btn", None),
+                    getattr(self, "next_btn", None),
+                    getattr(self, "open_folder_btn", None)):
+            if btn:
+                btn.configure(
+                    bg=t["btn_bg"], fg=t["btn_fg"],
+                    activebackground=t["btn_active_bg"],
+                    activeforeground=t["btn_active_fg"]
+                )
+
+        # Seek
+        if hasattr(self, "seek_frame"):
+            self.seek_frame.configure(bg=t["bg"])
+        if hasattr(self, "elapsed_label"):
+            self.elapsed_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "total_label"):
+            self.total_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "seek_scale"):
+            self.seek_scale.configure(
+                bg=t["bg"], fg=t["fg"],
+                troughcolor=t["scale_trough"],
+                activebackground=t["btn_active_bg"]
+            )
+
+        # Volume
+        if hasattr(self, "vol_frame"):
+            self.vol_frame.configure(bg=t["bg"])
+        if hasattr(self, "vol_label"):
+            self.vol_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "volume_scale"):
+            self.volume_scale.configure(
+                bg=t["bg"], fg=t["fg"],
+                troughcolor=t["scale_trough"],
+                activebackground=t["btn_active_bg"]
+            )
+
+        # Panes & Library
+        if hasattr(self, "panes"):
+            self.panes.configure(bg=t["bg"])
+        if hasattr(self, "lib_frame"):
+            self.lib_frame.configure(bg=t["bg"])
+        if hasattr(self, "lib_header_label"):
+            self.lib_header_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "search_frame"):
+            self.search_frame.configure(bg=t["bg"])
+        if hasattr(self, "search_entry"):
+            is_placeholder = self._search_showing_placeholder()
+            self.search_entry.configure(
+                bg=t["entry_bg"],
+                fg=t["search_placeholder_fg"] if is_placeholder else t["search_normal_fg"],
+                insertbackground=t["entry_insert"]
+            )
+        if hasattr(self, "suggestions_frame"):
+            self.suggestions_frame.configure(bg=t["border_black"])
+        if hasattr(self, "suggestions_listbox"):
+            self.suggestions_listbox.configure(
+                bg=t["entry_bg"], fg=t["entry_fg"],
+                selectbackground=t["select_bg"],
+                selectforeground=t["select_fg"]
+            )
+        if hasattr(self, "lib_list_frame"):
+            self.lib_list_frame.configure(bg=t["bg"])
+        if hasattr(self, "lib_scroll"):
+            self.lib_scroll.configure(
+                bg=t["btn_bg"], troughcolor=t["scale_trough"],
+                activebackground=t["btn_active_bg"]
+            )
+        if hasattr(self, "library_listbox"):
+            self.library_listbox.configure(
+                bg=t["entry_bg"], fg=t["entry_fg"],
+                selectbackground=t["select_bg"],
+                selectforeground=t["select_fg"]
+            )
+            self._highlight_now_playing()
+
+        # Middle buttons
+        if hasattr(self, "mid_frame"):
+            self.mid_frame.configure(bg=t["bg"])
+        if hasattr(self, "mid_inner"):
+            self.mid_inner.configure(bg=t["bg"])
+        for btn in (getattr(self, "enqueue_btn", None),
+                    getattr(self, "remove_btn", None),
+                    getattr(self, "clear_btn", None)):
+            if btn:
+                btn.configure(
+                    bg=t["btn_bg"], fg=t["btn_fg"],
+                    activebackground=t["btn_active_bg"],
+                    activeforeground=t["btn_active_fg"]
+                )
+
+        # Queue
+        if hasattr(self, "queue_frame"):
+            self.queue_frame.configure(bg=t["bg"])
+        if hasattr(self, "queue_header"):
+            self.queue_header.configure(bg=t["bg"])
+        if hasattr(self, "queue_title_label"):
+            self.queue_title_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "queue_count_label"):
+            self.queue_count_label.configure(bg=t["bg"], fg=t["fg"])
+        if hasattr(self, "queue_list_frame"):
+            self.queue_list_frame.configure(bg=t["bg"])
+        if hasattr(self, "queue_scroll"):
+            self.queue_scroll.configure(
+                bg=t["btn_bg"], troughcolor=t["scale_trough"],
+                activebackground=t["btn_active_bg"]
+            )
+        if hasattr(self, "queue_listbox"):
+            self.queue_listbox.configure(
+                bg=t["entry_bg"], fg=t["entry_fg"],
+                selectbackground=t["select_bg"],
+                selectforeground=t["select_fg"]
+            )
+
+        # Status bar
+        if hasattr(self, "status_bar"):
+            self.status_bar.configure(bg=t["bg"])
+        if hasattr(self, "status_label"):
+            self.status_label.configure(bg=t["bg"], fg=t["fg"])
 
     # -- library / folder handling --------------------------------------
 
@@ -632,6 +1034,171 @@ class WaveStackApp(tk.Tk):
             name = os.path.splitext(os.path.basename(path))[0]
             self.library_listbox.insert(tk.END, name)
         self._highlight_now_playing()
+        self._hide_suggestions()  # library changed; any open suggestions are stale
+
+    # -- search ---------------------------------------------------
+
+    def _on_focus_search_shortcut(self, event=None):
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, tk.END)
+        self.search_entry.icursor(tk.END)
+        return "break"
+
+    def _search_showing_placeholder(self):
+        t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+        return self.search_entry.get() == SEARCH_PLACEHOLDER_TEXT or self.search_entry.cget("fg") == t["search_placeholder_fg"]
+
+    def _clear_search_to_placeholder(self):
+        t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, SEARCH_PLACEHOLDER_TEXT)
+        self.search_entry.config(fg=t["search_placeholder_fg"])
+
+    def _on_search_keypress(self, event):
+        # Fires before the character is actually inserted. If the
+        # placeholder is showing, clear it first so the keystroke
+        # lands in an empty field instead of appending to (or getting
+        # lost inside) "search song". Safe to do for every key,
+        # including Backspace/Delete/arrows -- clearing an
+        # already-empty field is a harmless no-op.
+        if self._search_showing_placeholder():
+            t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.config(fg=t["search_normal_fg"])
+
+    def _on_search_key_release(self, event):
+        if event.keysym in _SEARCH_NON_TEXT_KEYSYMS:
+            return  # these don't change the query; avoid pointless rebuilds
+        self._update_suggestions()
+
+    def _on_search_focus_out(self, event=None):
+        # Delay briefly so a click landing on the suggestions list has
+        # a chance to register (and move focus there) before deciding
+        # whether to close the dropdown -- otherwise closing it here
+        # first could swallow that click.
+        self.after(120, self._resolve_search_focus_out)
+
+    def _resolve_search_focus_out(self):
+        if self.focus_get() is self.suggestions_listbox:
+            return
+        if not self.search_entry.get():
+            t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+            self.search_entry.config(fg=t["search_placeholder_fg"])
+            self.search_entry.insert(0, SEARCH_PLACEHOLDER_TEXT)
+        self._hide_suggestions()
+
+    def _on_search_enter(self, event=None):
+        if not self._current_suggestions:
+            return "break"
+        sel = self.suggestions_listbox.curselection()
+        idx = sel[0] if sel else 0
+        self._confirm_suggestion(idx)
+        return "break"
+
+    def _on_search_escape(self, event=None):
+        self._hide_suggestions()
+        self._clear_search_to_placeholder()
+        self.library_listbox.focus_set()
+        return "break"
+
+    def _on_search_arrow_down(self, event=None):
+        self._move_suggestion_selection(1)
+        return "break"
+
+    def _on_search_arrow_up(self, event=None):
+        self._move_suggestion_selection(-1)
+        return "break"
+
+    def _move_suggestion_selection(self, delta):
+        count = len(self._current_suggestions)
+        if count == 0:
+            return
+        sel = self.suggestions_listbox.curselection()
+        current = sel[0] if sel else 0
+        new_idx = max(0, min(count - 1, current + delta))
+        self.suggestions_listbox.selection_clear(0, tk.END)
+        self.suggestions_listbox.selection_set(new_idx)
+        self.suggestions_listbox.activate(new_idx)
+        self.suggestions_listbox.see(new_idx)
+
+    def _on_suggestion_clicked(self, event):
+        # Compute the clicked row directly from the click position
+        # rather than trusting curselection(): this instance-level
+        # binding runs before the Listbox's own class-level "select
+        # the clicked row" binding, so curselection() could still
+        # reflect the previous selection at this point.
+        idx = self.suggestions_listbox.nearest(event.y)
+        self._confirm_suggestion(idx)
+        return "break"
+
+    def _confirm_suggestion(self, idx):
+        if not (0 <= idx < len(self._current_suggestions)):
+            return
+        path = self._current_suggestions[idx]
+        self._select_track_in_library(path)
+        self._hide_suggestions()
+        self._clear_search_to_placeholder()
+        self.library_listbox.focus_set()
+
+    def _select_track_in_library(self, path):
+        if path not in self.library_files:
+            return
+        idx = self.library_files.index(path)
+        self.library_listbox.selection_clear(0, tk.END)
+        self.library_listbox.selection_set(idx)
+        self.library_listbox.activate(idx)
+        self.library_listbox.see(idx)
+
+    def _get_search_matches(self, query, limit=8):
+        query = query.strip().lower()
+        if not query:
+            return []
+        starts_with, contains = [], []
+        for path in self.library_files:
+            name = os.path.splitext(os.path.basename(path))[0].lower()
+            if name.startswith(query):
+                starts_with.append(path)
+            elif query in name:
+                contains.append(path)
+        return (starts_with + contains)[:limit]
+
+    def _update_suggestions(self):
+        query = "" if self._search_showing_placeholder() \
+            else self.search_entry.get()
+        if not query.strip():
+            self._hide_suggestions()
+            return
+        self._show_suggestions(self._get_search_matches(query))
+
+    def _show_suggestions(self, matches):
+        self._current_suggestions = matches
+        self.suggestions_listbox.delete(0, tk.END)
+        if matches:
+            for path in matches:
+                name = os.path.splitext(os.path.basename(path))[0]
+                self.suggestions_listbox.insert(tk.END, name)
+            self.suggestions_listbox.config(height=min(len(matches), 8))
+            self.suggestions_listbox.selection_clear(0, tk.END)
+            self.suggestions_listbox.selection_set(0)
+            self.suggestions_listbox.activate(0)
+        else:
+            self.suggestions_listbox.insert(tk.END, "(no matches)")
+            self.suggestions_listbox.config(height=1)
+
+        self._position_suggestions_box()
+        self.suggestions_frame.lift()
+
+    def _hide_suggestions(self):
+        self.suggestions_frame.place_forget()
+        self._current_suggestions = []
+
+    def _position_suggestions_box(self):
+        self.update_idletasks()
+        x = self.search_entry.winfo_rootx() - self.winfo_rootx()
+        y = (self.search_entry.winfo_rooty() - self.winfo_rooty()
+             + self.search_entry.winfo_height())
+        width = self.search_entry.winfo_width()
+        self.suggestions_frame.place(x=x, y=y, width=width)
 
     def show_startup_missing_dialog(self):
         message = (
@@ -664,6 +1231,13 @@ class WaveStackApp(tk.Tk):
             self.on_play_clicked()
 
     def _on_spacebar(self, event=None):
+        # An Entry widget (the search bar) inserts space as a normal
+        # character through its own class binding, which runs before
+        # this bind_all handler -- so by the time we get here the
+        # space has already been typed. We just need to avoid ALSO
+        # toggling playback as an unwanted side effect of searching.
+        if isinstance(self.focus_get(), tk.Entry):
+            return
         self.on_play_pause_toggle()
         return "break"
 
@@ -776,12 +1350,13 @@ class WaveStackApp(tk.Tk):
             self._pending_resume_seconds = None
 
     def _highlight_now_playing(self):
+        t = getattr(self, "theme", THEMES[DEFAULT_THEME])
         for i in range(self.library_listbox.size()):
-            self.library_listbox.itemconfig(i, bg="white", fg="black")
+            self.library_listbox.itemconfig(i, bg=t["entry_bg"], fg=t["entry_fg"])
         if self.now_playing in self.library_files:
             idx = self.library_files.index(self.now_playing)
-            self.library_listbox.itemconfig(idx, bg=SELECT_BG,
-                                             fg=SELECT_FG)
+            self.library_listbox.itemconfig(idx, bg=t["select_bg"],
+                                             fg=t["select_fg"])
 
     # -- queue management ---------------------------------------------------
 
@@ -837,7 +1412,11 @@ class WaveStackApp(tk.Tk):
             return
         self.library_listbox.selection_clear(0, tk.END)
         self.library_listbox.selection_set(idx)
-        menu = tk.Menu(self, tearoff=0, bg=BG, font=self.font_normal)
+        t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+        menu = tk.Menu(self, tearoff=0, bg=t["menu_bg"], fg=t["menu_fg"],
+                       activebackground=t["menu_active_bg"],
+                       activeforeground=t["menu_active_fg"],
+                       font=self.font_normal)
         menu.add_command(label="Play", command=self.on_play_clicked)
         menu.add_command(label="Add to Queue",
                           command=self.on_enqueue_clicked)
@@ -854,7 +1433,11 @@ class WaveStackApp(tk.Tk):
             return
         self.queue_listbox.selection_clear(0, tk.END)
         self.queue_listbox.selection_set(idx)
-        menu = tk.Menu(self, tearoff=0, bg=BG, font=self.font_normal)
+        t = getattr(self, "theme", THEMES[DEFAULT_THEME])
+        menu = tk.Menu(self, tearoff=0, bg=t["menu_bg"], fg=t["menu_fg"],
+                       activebackground=t["menu_active_bg"],
+                       activeforeground=t["menu_active_fg"],
+                       font=self.font_normal)
         menu.add_command(label="Play Now",
                           command=lambda: self._play_from_queue_index(idx))
         menu.add_command(label="Remove from Queue",
@@ -986,6 +1569,7 @@ class WaveStackApp(tk.Tk):
                 "position_seconds": (
                     self.audio.get_time_seconds() if self.now_playing
                     else 0.0),
+                "theme": getattr(self, "current_theme_name", DEFAULT_THEME),
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f)
@@ -1012,6 +1596,10 @@ class WaveStackApp(tk.Tk):
         state = self._load_state_file()
         if not state:
             return
+
+        theme = state.get("theme")
+        if theme in THEMES and theme != self.current_theme_name:
+            self.apply_theme(theme)
 
         volume = state.get("volume")
         if isinstance(volume, (int, float)):
