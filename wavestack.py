@@ -13,6 +13,9 @@ Design notes
 * Playback is handled by libVLC (via python-vlc), which is far more
   robust against odd file encodings, VBR MP3s, and PipeWire/PulseAudio
   quirks than pure-Python audio libraries, and gives rock-solid seeking.
+* The spinning vinyl widget's album art comes only from each MP3's own
+  embedded ID3 tag (read locally with mutagen) -- never fetched from
+  the web, consistent with the zero-network-access design above.
 
 A note on window chrome: the outer title bar, minimize/close buttons,
 etc. are left to your desktop's own window manager rather than
@@ -28,6 +31,7 @@ import json
 import time
 import queue
 import traceback
+from io import BytesIO
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog
@@ -36,6 +40,19 @@ try:
     import vlc
 except ImportError:
     vlc = None
+
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    from mutagen.id3 import ID3
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +146,16 @@ SELECT_FG = THEMES["light"]["select_fg"]
 LCD_BG = THEMES["light"]["lcd_bg"]
 LCD_FG = THEMES["light"]["lcd_fg"]
 
+# Vinyl disc palette -- deliberately more "real object" than "UI
+# chrome": a physical record is black vinyl with a colored paper
+# label, not another gray Windows-95 panel.
+VINYL_DISC_COLOR = (18, 18, 18, 255)
+VINYL_LABEL_COLOR = (122, 28, 28, 255)      # classic deep vinyl-label red
+VINYL_GROOVE_LIGHT = (46, 46, 46, 255)
+VINYL_GROOVE_DARK = (26, 26, 26, 255)
+VINYL_RIM_HIGHLIGHT = (55, 55, 55, 255)
+VINYL_HOLE_COLOR = (0, 0, 0, 255)
+
 SEARCH_PLACEHOLDER_TEXT = "search song"
 SEARCH_PLACEHOLDER_FG = THEMES["light"]["search_placeholder_fg"]
 SEARCH_NORMAL_FG = THEMES["light"]["search_normal_fg"]
@@ -201,6 +228,46 @@ def scan_mp3_files(directory):
                 files.append(full_path)
     files.sort(key=lambda p: os.path.basename(p).lower())
     return files
+
+
+def extract_album_art_bytes(filepath):
+    """Return the raw bytes of the first embedded ID3 cover-art frame
+    in *filepath*, or None if there isn't one, mutagen isn't
+    installed, or the file's tags can't be read for any reason. Reads
+    only the file's own local ID3 tag -- never touches the network."""
+    if not MUTAGEN_AVAILABLE:
+        return None
+    try:
+        tags = ID3(filepath)
+    except Exception:
+        return None  # no ID3 header, corrupt tag, etc. -- just means no art
+    for key in tags.keys():
+        if key.startswith("APIC"):
+            return tags[key].data
+    return None
+
+
+def _crop_to_square(img):
+    """Center-crop an image to a square, so resizing it afterward
+    doesn't distort non-square album art."""
+    w, h = img.size
+    if w == h:
+        return img
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    return img.crop((left, top, left + side, top + side))
+
+
+def _make_circular_mask(size, supersample=4):
+    """A smooth, anti-aliased circular alpha mask, size x size.
+    Drawing at supersample x the target size and downsampling avoids
+    the jagged edge a single ellipse() at small sizes would have."""
+    big = size * supersample
+    mask = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, big - 1, big - 1), fill=255)
+    return mask.resize((size, size), Image.LANCZOS)
+
 
 
 # --------------------------------------------------------------------------
@@ -345,6 +412,212 @@ class NowPlayingDisplay(tk.Frame):
         self.configure(bg=theme.get("border_black", BORDER_BLACK))
         self.canvas.configure(bg=theme.get("lcd_bg", LCD_BG))
         self.canvas.itemconfigure(self.text_id, fill=theme.get("lcd_fg", LCD_FG))
+
+
+# --------------------------------------------------------------------------
+# Spinning vinyl record widget
+# --------------------------------------------------------------------------
+
+class VinylDisc(tk.Frame):
+    """A procedurally-drawn, animated vinyl record.
+
+    Spins clockwise while a track plays, freezes at its current angle
+    the instant it's paused, and resets to 0 degrees when stopped or
+    nothing is loaded. If the loaded MP3 has embedded ID3 cover art,
+    it's masked into a circle and composited onto the label; a track
+    with no embedded art just shows the plain disc.
+
+    Performance note: load_track() does the (relatively) expensive
+    work -- extracting art, cropping, masking, compositing -- exactly
+    once per track and caches the result in self._base_image. The
+    50ms animation loop only rotates that already-built image; it
+    never re-extracts or re-composites per frame.
+
+    Degrades gracefully if Pillow isn't installed: shows a plain
+    static disc drawn with Tkinter's own canvas primitives (no PIL
+    needed for that) and a short note, rather than crashing or
+    leaving a blank gap. The rest of the player is unaffected either
+    way -- this widget's dependencies are optional, unlike libVLC.
+    """
+
+    SIZE = 120
+    SPIN_STEP_DEGREES = 5   # ~3.6s per rotation at TICK_MS below
+    TICK_MS = 50             # matches the requested update cadence
+
+    def __init__(self, parent, theme=None):
+        if theme is None:
+            theme = getattr(parent, "theme", None) or THEMES[DEFAULT_THEME]
+        self.theme = theme
+        bg = theme["bg"]
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, width=self.SIZE, height=self.SIZE,
+                                 bg=bg, highlightthickness=0)
+        self.canvas.pack()
+
+        self._angle = 0.0
+        self._spinning = False
+        self._after_id = None
+        self._image_item = None
+        self._current_photo = None   # persistent PhotoImage reference --
+        # Tkinter/Tcl does not keep its own strong reference to the
+        # image data behind a PhotoImage, only to the (tiny) handle
+        # object. If this attribute were allowed to be reassigned
+        # without anything else referencing the old PhotoImage first,
+        # or simply never stored at all, Python's garbage collector
+        # would free it and the canvas would go blank or flicker --
+        # a well-known Tkinter pitfall this attribute exists to avoid.
+
+        if PIL_AVAILABLE:
+            self._blank_vinyl = self._draw_blank_vinyl()
+            self._base_image = self._blank_vinyl
+            self._render_frame()
+        else:
+            self._blank_vinyl = None
+            self._base_image = None
+            self.canvas.create_oval(4, 4, self.SIZE - 4, self.SIZE - 4,
+                                     fill="#202020", outline=theme.get("border_black", BORDER_BLACK))
+            self.canvas.create_text(
+                self.SIZE // 2, self.SIZE // 2,
+                text="Vinyl needs\nPillow", fill=theme.get("search_placeholder_fg", "#999999"),
+                font=("TkDefaultFont", 7), justify=tk.CENTER)
+
+    def apply_theme(self, theme):
+        self.theme = theme
+        self.configure(bg=theme["bg"])
+        self.canvas.configure(bg=theme["bg"])
+
+    # -- drawing -----------------------------------------------
+
+    def _draw_blank_vinyl(self):
+        size = self.SIZE
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        cx = cy = size / 2
+        disc_r = size / 2 - 2
+
+        draw.ellipse((cx - disc_r, cy - disc_r, cx + disc_r, cy + disc_r),
+                     fill=VINYL_DISC_COLOR, outline=VINYL_RIM_HIGHLIGHT)
+
+        label_r = disc_r * 0.36
+        groove_count = 10
+        for i in range(groove_count):
+            r = label_r + (disc_r - label_r) * (i + 1) / (groove_count + 1)
+            color = VINYL_GROOVE_LIGHT if i % 2 == 0 else VINYL_GROOVE_DARK
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=color)
+
+        draw.ellipse((cx - label_r, cy - label_r, cx + label_r, cy + label_r),
+                     fill=VINYL_LABEL_COLOR)
+
+        self._draw_spindle_hole(draw, cx, cy, disc_r)
+        return img
+
+    def _draw_spindle_hole(self, draw, cx, cy, disc_r):
+        hole_r = max(2, disc_r * 0.045)
+        draw.ellipse((cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r),
+                     fill=VINYL_HOLE_COLOR)
+
+    def _composite_album_art(self, art_bytes):
+        try:
+            art = Image.open(BytesIO(art_bytes))
+            art.load()  # force full decode now, so a truncated/corrupt
+            art = art.convert("RGB")  # image is caught here, not later
+        except Exception:
+            return self._blank_vinyl
+
+        size = self.SIZE
+        cx = cy = size / 2
+        disc_r = size / 2 - 2
+        label_r = disc_r * 0.36
+        label_d = max(2, int(label_r * 2))
+
+        art = _crop_to_square(art).resize((label_d, label_d), Image.LANCZOS)
+        mask = _make_circular_mask(label_d)
+        circular_art = Image.new("RGBA", (label_d, label_d), (0, 0, 0, 0))
+        circular_art.paste(art, (0, 0), mask)
+
+        combined = self._blank_vinyl.copy()
+        top_left = (int(cx - label_d / 2), int(cy - label_d / 2))
+        combined.paste(circular_art, top_left, circular_art)
+
+        # The art circle covers the spindle hole; redraw it on top.
+        self._draw_spindle_hole(ImageDraw.Draw(combined), cx, cy, disc_r)
+        return combined
+
+    # -- public API -----------------------------------------------
+
+    def load_track(self, filepath):
+        """Call once when a new track starts playing. Does all the
+        expensive image work up front and caches the result -- see
+        the class docstring's performance note."""
+        if not PIL_AVAILABLE:
+            return
+        art_bytes = extract_album_art_bytes(filepath)
+        self._base_image = (self._composite_album_art(art_bytes)
+                             if art_bytes else self._blank_vinyl)
+        self._angle = 0.0
+        self._render_frame()
+
+    def start_spinning(self):
+        if not PIL_AVAILABLE:
+            return
+        if self._spinning and self._after_id is not None:
+            return  # already spinning; don't disturb the tick timer
+        self._spinning = True
+        self._schedule_next_tick()
+
+    def pause_spinning(self):
+        """Stops advancing rotation but leaves the angle exactly where
+        it was -- paused should look frozen mid-turn, not reset."""
+        self._spinning = False
+        self._cancel_pending_tick()
+
+    def stop_and_reset(self):
+        self._spinning = False
+        self._cancel_pending_tick()
+        self._angle = 0.0
+        if PIL_AVAILABLE:
+            self._render_frame()
+
+    def shutdown(self):
+        self._cancel_pending_tick()
+
+    # -- animation internals -----------------------------------------------
+
+    def _schedule_next_tick(self):
+        self._cancel_pending_tick()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+
+    def _cancel_pending_tick(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _tick(self):
+        self._after_id = None
+        if not self._spinning:
+            return
+        # PIL's rotate() turns counter-clockwise for positive angles,
+        # so subtracting the step (then wrapping into 0-359) is what
+        # actually produces clockwise motion on screen.
+        self._angle = (self._angle - self.SPIN_STEP_DEGREES) % 360
+        self._render_frame()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+
+    def _render_frame(self):
+        if self._base_image is None:
+            return
+        rotated = self._base_image.rotate(self._angle, resample=Image.BICUBIC)
+        photo = ImageTk.PhotoImage(rotated)
+        self._current_photo = photo  # see the __init__ comment on why
+        if self._image_item is None:
+            self._image_item = self.canvas.create_image(
+                self.SIZE // 2, self.SIZE // 2, image=photo)
+        else:
+            self.canvas.itemconfig(self._image_item, image=photo)
+
 
 
 # --------------------------------------------------------------------------
@@ -781,6 +1054,10 @@ class WaveStackApp(tk.Tk):
                   activeforeground=t["btn_active_fg"])
         self.clear_btn.pack(pady=6, fill=tk.X)
 
+        self.vinyl = VinylDisc(self.mid_inner, theme=t)
+        self.vinyl.pack(pady=(14, 6))
+
+
         # -- Queue pane --
         self.queue_frame = tk.Frame(self.panes, bg=t["bg"], bd=2, relief=tk.SUNKEN)
         self.queue_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
@@ -976,6 +1253,10 @@ class WaveStackApp(tk.Tk):
                     activebackground=t["btn_active_bg"],
                     activeforeground=t["btn_active_fg"]
                 )
+
+        # Vinyl widget
+        if hasattr(self, "vinyl"):
+            self.vinyl.apply_theme(t)
 
         # Queue
         if hasattr(self, "queue_frame"):
@@ -1241,6 +1522,20 @@ class WaveStackApp(tk.Tk):
         self.on_play_pause_toggle()
         return "break"
 
+    def _sync_vinyl_spin_state(self):
+        """Drives the vinyl widget from the same three-state model
+        (playing / paused / stopped-or-nothing) used everywhere else
+        in the app, e.g. on_play_pause_toggle(). Cheap and idempotent,
+        so it's safe to call from every place playback state changes
+        without worrying about redundant calls."""
+        if hasattr(self, "vinyl"):
+            if self.now_playing and not self.is_paused and not self.is_stopped:
+                self.vinyl.start_spinning()
+            elif self.now_playing and self.is_paused:
+                self.vinyl.pause_spinning()
+            else:
+                self.vinyl.stop_and_reset()
+
     def on_play_clicked(self):
         if self.is_paused and self.now_playing:
             self.audio.resume()
@@ -1248,6 +1543,7 @@ class WaveStackApp(tk.Tk):
             self.is_stopped = False
             self.status_var.set(
                 f"Playing: {os.path.basename(self.now_playing)}")
+            self._sync_vinyl_spin_state()
             return
         sel = self.library_listbox.curselection()
         if sel:
@@ -1265,6 +1561,7 @@ class WaveStackApp(tk.Tk):
             self.is_paused = True
             self.status_var.set(
                 f"Paused: {os.path.basename(self.now_playing)}")
+            self._sync_vinyl_spin_state()
 
     def on_stop_clicked(self):
         self.audio.stop()
@@ -1276,6 +1573,7 @@ class WaveStackApp(tk.Tk):
         self.seek_scale.set(0)
         self.elapsed_var.set("00:00")
         self.status_var.set("Stopped")
+        self._sync_vinyl_spin_state()
 
     def on_next_clicked(self):
         self._advance(auto=False)
@@ -1342,6 +1640,9 @@ class WaveStackApp(tk.Tk):
             os.path.splitext(os.path.basename(path))[0])
         self.status_var.set(f"Playing: {os.path.basename(path)}")
         self._highlight_now_playing()
+        if hasattr(self, "vinyl"):
+            self.vinyl.load_track(path)  # extracts/caches art once per track
+        self._sync_vinyl_spin_state()
 
         if resume_position and resume_position > 0:
             self._pending_resume_seconds = resume_position
@@ -1493,6 +1794,12 @@ class WaveStackApp(tk.Tk):
         if self.now_playing:
             self._maybe_autosave()
 
+        # Cheap and idempotent -- a defensive safety net alongside the
+        # precise calls already at each state-transition point, in
+        # case any future code path changes playback state without
+        # remembering to sync the vinyl too.
+        self._sync_vinyl_spin_state()
+
         self.now_playing_display.tick()
         self._tick_id = self.after(250, self._tick)
 
@@ -1519,6 +1826,7 @@ class WaveStackApp(tk.Tk):
             f"Resumed: {os.path.basename(self.now_playing)} "
             f"at {format_time(target)}")
         self._pending_resume_seconds = None
+        self._sync_vinyl_spin_state()
 
     def _maybe_autosave(self):
         now = time.time()
@@ -1628,6 +1936,8 @@ class WaveStackApp(tk.Tk):
                     self.after_cancel(job_id)
                 except Exception:
                     pass
+        if hasattr(self, "vinyl"):
+            self.vinyl.shutdown()
         self.save_state()
         self.audio.release()
         self.destroy()
