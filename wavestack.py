@@ -28,9 +28,13 @@ the window is fully retro-styled.
 import os
 import sys
 import json
+import re
 import time
 import queue
 import traceback
+import threading
+import urllib.parse
+import requests
 from io import BytesIO
 import tkinter as tk
 import tkinter.font as tkfont
@@ -49,6 +53,7 @@ except ImportError:
 
 try:
     from mutagen.id3 import ID3
+    from mutagen.easyid3 import EasyID3
     MUTAGEN_AVAILABLE = True
 except ImportError:
     MUTAGEN_AVAILABLE = False
@@ -155,6 +160,16 @@ VINYL_GROOVE_LIGHT = (46, 46, 46, 255)
 VINYL_GROOVE_DARK = (26, 26, 26, 255)
 VINYL_RIM_HIGHLIGHT = (55, 55, 55, 255)
 VINYL_HOLE_COLOR = (0, 0, 0, 255)
+
+# CRT Lyrics Terminal palette -- always phosphor-green-on-black regardless
+# of the chassis theme: a real CRT screen doesn't change colour just
+# because the case around it is light gray or charcoal.
+CRT_BG          = "#051505"   # deep near-black phosphor screen
+CRT_FG_ACTIVE   = "#00FF66"   # bright phosphor green -- the current lyric line
+CRT_FG_DIM      = "#1A6633"   # dim/inactive lines
+CRT_ACTIVE_BG   = "#00FF66"   # reverse-video highlight background
+CRT_ACTIVE_FG   = "#000000"   # reverse-video highlight foreground (black)
+CRT_BANNER_FG   = "#00AA44"   # slightly dimmer than active, for the title banner
 
 SEARCH_PLACEHOLDER_TEXT = "search song"
 SEARCH_PLACEHOLDER_FG = THEMES["light"]["search_placeholder_fg"]
@@ -268,6 +283,64 @@ def _make_circular_mask(size, supersample=4):
     ImageDraw.Draw(mask).ellipse((0, 0, big - 1, big - 1), fill=255)
     return mask.resize((size, size), Image.LANCZOS)
 
+
+
+# LRC timestamp pattern: [mm:ss.xx] or [mm:ss] -- metadata tags like
+# [ti:...] / [ar:...] / [al:...] share the same bracket syntax but have
+# a non-numeric character immediately after '[', so the digit-anchored
+# pattern below skips them naturally.
+_LRC_TIMESTAMP_RE = re.compile(
+    r"\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]"
+)
+
+
+def parse_lrc(filepath):
+    """Parse an LRC file and return [(timestamp_ms, lyric_text), ...].
+
+    Supports both ``[mm:ss.xx]`` and ``[mm:ss]`` timestamp formats.
+    Multiple timestamps on the same line (common in LRC chorus repeats)
+    each produce their own entry sharing the same lyric text.
+    Returns an empty list if the file does not exist, contains no valid
+    timestamp lines, or raises any OS/encoding error.
+    """
+    if not filepath or not os.path.isfile(filepath):
+        return []
+    try:
+        with open(filepath, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except UnicodeDecodeError:
+        try:
+            with open(filepath, "r", encoding="latin-1") as fh:
+                raw = fh.read()
+        except OSError:
+            return []
+    except OSError:
+        return []
+
+    entries = []
+    for line in raw.splitlines():
+        # Strip all leading timestamp tags, collect their ms values
+        timestamps = []
+        rest = line
+        while True:
+            m = _LRC_TIMESTAMP_RE.match(rest)
+            if not m:
+                break
+            minutes = int(m.group(1))
+            seconds = int(m.group(2))
+            centis  = m.group(3) or "0"
+            # centis may be 1-3 digits; normalise to milliseconds
+            millis  = int(centis.ljust(3, "0")[:3])
+            timestamps.append(minutes * 60_000 + seconds * 1_000 + millis)
+            rest = rest[m.end():]
+        if not timestamps:
+            continue  # metadata line or blank
+        lyric = rest.strip()
+        for ms in timestamps:
+            entries.append((ms, lyric))
+
+    entries.sort(key=lambda x: x[0])
+    return entries
 
 
 # --------------------------------------------------------------------------
@@ -618,6 +691,364 @@ class VinylDisc(tk.Frame):
         else:
             self.canvas.itemconfig(self._image_item, image=photo)
 
+class Visualizer(tk.Frame):
+    """A simulated, 90s-style LED spectrum analyzer.
+ 
+    Extracting real-time PCM sample data from libVLC in pure Python
+    is fragile and version-dependent -- it generally needs a custom
+    audio callback wired up through ctypes against a specific libvlc
+    build, which is a poor fit for a robustness-first app. Instead,
+    this draws a convincing, audio-reactive-*looking* bar animation:
+    each bar occasionally rolls a new random target height, then
+    eases toward it with a fast attack and a slower decay -- the same
+    asymmetry real level meters use, since it reads as musical motion
+    rather than as flickering noise.
+ 
+    Ties into the exact same three-state model the vinyl disc does
+    (see WaveStackApp._sync_playback_visuals): animates only while
+    genuinely playing, freezes instantly -- holding its current bar
+    heights -- on pause, and drops flat to zero on stop. Peak bar
+    heights scale with the current volume slider via set_volume().
+ 
+    The canvas is a fixed black-with-green-LEDs "hardware display",
+    like the LCD now-playing marquee -- deliberately NOT theme-tinted,
+    the same way a real equalizer's display doesn't repaint itself
+    when you change your desktop wallpaper. Only the frame around it
+    follows the current theme, for a tidy edge.
+    """
+ 
+    BAR_COUNT = 28
+    SEGMENTS_PER_BAR = 14
+    TICK_MS = 60   # ~16 fps: smooth, but leaves plenty of headroom
+ 
+    CANVAS_BG = "#050505"
+    SEGMENT_OFF = "#123312"
+    SEGMENT_GREEN = "#39FF14"
+    SEGMENT_YELLOW = "#E8FF39"
+    SEGMENT_RED = "#FF3B30"
+    HINT_FG = "#2E6B2E"
+ 
+    def __init__(self, parent, theme=None):
+        if theme is None:
+            theme = getattr(parent, "theme", None) or THEMES[DEFAULT_THEME]
+        self.theme = theme
+        super().__init__(parent, bg=theme["bg"], bd=2, relief=tk.SUNKEN)
+ 
+        self.canvas = tk.Canvas(self, bg=self.CANVAS_BG, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+ 
+        self._running = False
+        self._after_id = None
+        self._volume_percent = 70
+        self._heights = [0.0] * self.BAR_COUNT
+        self._targets = [0.0] * self.BAR_COUNT
+        # Bars toward the left re-roll their target less often (bigger,
+        # more sustained swings, evoking bass); bars toward the right
+        # re-roll more often (quicker flickers, evoking treble) -- a
+        # recognizable, classic spectrum-analyzer visual pattern.
+        self._reroll_chance = [
+            0.06 + 0.22 * (i / max(1, self.BAR_COUNT - 1))
+            for i in range(self.BAR_COUNT)
+        ]
+        self._segment_ids = [[] for _ in range(self.BAR_COUNT)]
+        self._hint_id = None
+ 
+        self.canvas.bind("<Configure>", lambda e: self._layout())
+        self.after_idle(self._layout)
+ 
+    def apply_theme(self, theme):
+        self.theme = theme
+        self.configure(bg=theme["bg"])
+        # The canvas itself intentionally stays fixed black/green
+        # regardless of theme -- see the class docstring.
+ 
+    # -- public API -----------------------------------------------
+ 
+    def set_volume(self, percent):
+        self._volume_percent = max(0, min(100, int(percent)))
+ 
+    def start_animating(self):
+        if self._running and self._after_id is not None:
+            return  # already animating; don't disturb the tick timer
+        self._running = True
+        self._schedule_next_tick()
+ 
+    def pause_animating(self):
+        """Freezes exactly where the bars currently are -- paused
+        should look like the music stopped mid-beat, not reset."""
+        self._running = False
+        self._cancel_pending_tick()
+ 
+    def stop_and_reset(self):
+        self._running = False
+        self._cancel_pending_tick()
+        self._heights = [0.0] * self.BAR_COUNT
+        self._targets = [0.0] * self.BAR_COUNT
+        self._render_frame()
+ 
+    def shutdown(self):
+        self._cancel_pending_tick()
+ 
+    # -- animation internals ----------------------------------------------
+ 
+    def _schedule_next_tick(self):
+        self._cancel_pending_tick()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+ 
+    def _cancel_pending_tick(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+ 
+    def _tick(self):
+        self._after_id = None
+        if not self._running:
+            return
+        vol_scale = self._volume_percent / 100.0
+        for i in range(self.BAR_COUNT):
+            if random.random() < self._reroll_chance[i]:
+                self._targets[i] = random.uniform(0.12, 1.0) * vol_scale
+            current = self._heights[i]
+            target = self._targets[i]
+            if target > current:
+                self._heights[i] = current + (target - current) * 0.55  # fast attack
+            else:
+                self._heights[i] = current + (target - current) * 0.18  # slower decay
+        self._render_frame()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+ 
+    # -- drawing -----------------------------------------------
+ 
+    def _layout(self):
+        """(Re)builds the LED segment grid to fit the canvas's current
+        size. Safe to call on resize: it doesn't touch self._heights,
+        it only repositions/recreates the rectangles that display
+        them, so a resize never disturbs the running animation."""
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return  # not mapped/sized yet (e.g. before it's ever packed)
+        self.canvas.delete("all")
+        self._segment_ids = [[] for _ in range(self.BAR_COUNT)]
+ 
+        margin = 6
+        hint_h = 16
+        usable_h = max(10, height - margin * 2 - hint_h)
+        usable_w = max(10, width - margin * 2)
+        gap = 2
+        bar_w = max(2, (usable_w - gap * (self.BAR_COUNT - 1)) / self.BAR_COUNT)
+        seg_gap = 1
+        seg_h = max(2, (usable_h - seg_gap * (self.SEGMENTS_PER_BAR - 1))
+                    / self.SEGMENTS_PER_BAR)
+ 
+        for i in range(self.BAR_COUNT):
+            x0 = margin + i * (bar_w + gap)
+            x1 = x0 + bar_w
+            for row in range(self.SEGMENTS_PER_BAR):
+                # row 0 = bottom segment, drawn first
+                y1 = margin + usable_h - row * (seg_h + seg_gap)
+                y0 = y1 - seg_h
+                rect = self.canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=self.SEGMENT_OFF, outline="")
+                self._segment_ids[i].append(rect)
+ 
+        self._hint_id = self.canvas.create_text(
+            width // 2, height - hint_h // 2,
+            text="Press ESC to return", fill=self.HINT_FG,
+            font=("TkDefaultFont", 8))
+ 
+        self._render_frame()
+ 
+    def _segment_color(self, row_from_bottom):
+        frac = row_from_bottom / max(1, self.SEGMENTS_PER_BAR - 1)
+        if frac >= 0.85:
+            return self.SEGMENT_RED
+        if frac >= 0.65:
+            return self.SEGMENT_YELLOW
+        return self.SEGMENT_GREEN
+ 
+    def _render_frame(self):
+        for i, h in enumerate(self._heights):
+            lit = int(round(h * self.SEGMENTS_PER_BAR))
+            ids = self._segment_ids[i] if i < len(self._segment_ids) else []
+            for row, seg_id in enumerate(ids):
+                color = self._segment_color(row) if row < lit else self.SEGMENT_OFF
+                self.canvas.itemconfig(seg_id, fill=color)
+ 
+ 
+
+
+# --------------------------------------------------------------------------
+# CRT Lyrics Terminal widget
+# --------------------------------------------------------------------------
+
+class CrtLyricsDisplay(tk.Frame):
+    """A retro CRT phosphor-green lyrics terminal synced to libVLC playback.
+
+    The widget is always styled as a phosphor-green CRT screen regardless of
+    the outer chassis theme -- a real monitor doesn't change colour when you
+    repaint the case. The only thing that adapts to the theme is the outer
+    border *frame* background, so there's no ugly gap between the chassis and
+    the screen bezel.
+
+    Syncing works by calling sync_to_ms(ms) from the main _tick() loop. The
+    method walks the pre-parsed LRC entry list backwards to find the last line
+    whose timestamp is <= the current position, highlights it with a classic
+    reverse-video phosphor effect, and scrolls the Text widget to keep that
+    line vertically centred.
+    """
+
+    _MSG_WAITING  = "[ WAITING FOR TRACK... ]"
+    _MSG_NO_LYRICS = "[ NO SYNCED LYRICS AVAILABLE ]"
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=CRT_BG, bd=3, relief=tk.SUNKEN, **kwargs)
+
+        # Title banner
+        self._banner = tk.Label(
+            self, text="\u2500 LYRICS TERMINAL [SYNCED] \u2500",
+            bg=CRT_BG, fg=CRT_BANNER_FG,
+            font=("TkFixedFont", 8, "bold"),
+            anchor="center"
+        )
+        self._banner.pack(fill=tk.X, padx=2, pady=(3, 0))
+
+        # The Text widget that holds all lyric lines. It's always in DISABLED
+        # state for the user (no editing), but we temporarily enable it for
+        # programmatic updates and disable again immediately after.
+        self._text = tk.Text(
+            self, bg=CRT_BG, fg=CRT_FG_DIM,
+            font=("TkFixedFont", 9),
+            relief=tk.FLAT, bd=0,
+            highlightthickness=0,
+            wrap=tk.WORD,
+            cursor="arrow",
+            state=tk.DISABLED,
+            padx=4, pady=4,
+        )
+        self._scrollbar = tk.Scrollbar(self, orient=tk.VERTICAL,
+                                        command=self._text.yview,
+                                        bg=CRT_BG, troughcolor=CRT_BG,
+                                        activebackground="#005522")
+        self._text.configure(yscrollcommand=self._scrollbar.set)
+        self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Tag definitions for dim (default), active line, and the banner msg
+        self._text.tag_configure("dim",    foreground=CRT_FG_DIM)
+        self._text.tag_configure("active", foreground=CRT_ACTIVE_FG,
+                                  background=CRT_ACTIVE_BG,
+                                  font=("TkFixedFont", 9, "bold"))
+        self._text.tag_configure("notice", foreground=CRT_BANNER_FG,
+                                  justify="center")
+
+        self._lines      = []   # [(timestamp_ms, lyric_text), ...]
+        self._active_idx = -1   # index of currently highlighted line
+
+        self._show_message(self._MSG_WAITING)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+
+    def _write(self, func):
+        """Temporarily enable the Text widget, run *func*, then re-disable."""
+        self._text.configure(state=tk.NORMAL)
+        try:
+            func()
+        finally:
+            self._text.configure(state=tk.DISABLED)
+
+    def _show_message(self, msg):
+        """Clear the widget and show a single centred notice message."""
+        def _do():
+            self._text.delete("1.0", tk.END)
+            self._text.insert(tk.END, "\n\n" + msg + "\n", "notice")
+        self._write(_do)
+        self._lines = []
+        self._active_idx = -1
+
+    def _render_all_lines(self):
+        """Re-draw all lyric lines in the dim style (called after load_track)."""
+        def _do():
+            self._text.delete("1.0", tk.END)
+            for _ms, text in self._lines:
+                self._text.insert(tk.END, text + "\n", "dim")
+        self._write(_do)
+        self._active_idx = -1
+
+    # ------------------------------------------------------------------
+    # Public API
+
+    def load_track(self, mp3_path):
+        """Attempt to load the matching .lrc file for *mp3_path*.
+
+        If found and parseable, renders all lyric lines ready for sync.
+        Otherwise shows the NO SYNCED LYRICS notice.
+        """
+        lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+        entries = parse_lrc(lrc_path)
+        if entries:
+            self._lines = entries
+            self._render_all_lines()
+        else:
+            self._show_message(self._MSG_NO_LYRICS)
+
+    def sync_to_ms(self, ms):
+        """Highlight the lyric line active at position *ms* milliseconds.
+
+        Does nothing if there are no lyrics loaded. Skips the redraw if
+        the active line hasn't changed since the last call (cheap & safe
+        to call every 250 ms from _tick).
+        """
+        if not self._lines:
+            return
+
+        # Binary-search backwards: find the last entry with timestamp <= ms
+        lo, hi = 0, len(self._lines) - 1
+        new_idx = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._lines[mid][0] <= ms:
+                new_idx = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if new_idx == self._active_idx:
+            return  # nothing changed; skip the expensive Text update
+
+        old_idx = self._active_idx
+        self._active_idx = new_idx
+
+        def _do():
+            # Restore old active line to dim style
+            if old_idx >= 0:
+                line_num = old_idx + 1
+                self._text.tag_remove("active",
+                                       f"{line_num}.0", f"{line_num}.end")
+                self._text.tag_add("dim",
+                                    f"{line_num}.0", f"{line_num}.end")
+            # Apply active highlight to new line
+            line_num = new_idx + 1
+            self._text.tag_remove("dim",
+                                    f"{line_num}.0", f"{line_num}.end")
+            self._text.tag_add("active",
+                                f"{line_num}.0", f"{line_num}.end")
+            # Scroll so the active line is visible (centred as best Tk can)
+            self._text.see(f"{line_num}.0")
+
+        self._write(_do)
+
+    def show_stopped(self):
+        """Show the 'waiting for track' notice when playback is stopped."""
+        self._show_message(self._MSG_WAITING)
+
+    def show_no_lyrics(self):
+        """Explicitly show the 'no synced lyrics' notice."""
+        self._show_message(self._MSG_NO_LYRICS)
 
 
 # --------------------------------------------------------------------------
@@ -747,6 +1178,11 @@ class WaveStackApp(tk.Tk):
         # paths currently shown in the dropdown, in display order, so
         # a click or Enter can map a row straight back to a path.
         self._current_suggestions = []
+        # LRC sync state
+        self.sync_enabled = False
+        self.sync_thread = None
+        self.cancel_sync = threading.Event()
+        self.lrc_status_var = tk.StringVar(value="No internet access (Offline Mode)")
 
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="00:00")
@@ -879,8 +1315,6 @@ class WaveStackApp(tk.Tk):
             padx=5, pady=0, cursor="hand2"
         )
         self.theme_btn.pack(side=tk.RIGHT, padx=(4, 8), pady=4)
-        self.theme_btn.bind("<Enter>", lambda e: self._on_theme_btn_hover(True))
-        self.theme_btn.bind("<Leave>", lambda e: self._on_theme_btn_hover(False))
 
         self.subtitle_label = tk.Label(self.header_frame, text="100% Offline MP3 Player",
                                        bg=t["bg"], fg=t["fg"],
@@ -917,6 +1351,10 @@ class WaveStackApp(tk.Tk):
         for b in (self.prev_btn, self.play_btn, self.pause_btn,
                   self.stop_btn, self.next_btn):
             b.pack(side=tk.LEFT, padx=3, pady=3)
+
+        self.visualizer_btn = make_button(self.transport_frame, "Audio Visualizer",
+                                          self.toggle_visualizer)
+        self.visualizer_btn.pack(side=tk.LEFT, padx=(10, 3), pady=3)
 
         self.open_folder_btn = make_button(self.transport_frame, "Open Folder...",
                                             self.on_open_folder)
@@ -959,9 +1397,27 @@ class WaveStackApp(tk.Tk):
         self.volume_scale.pack(side=tk.LEFT)
         self.audio.set_volume(70)
 
+        # Status bar
+        self.status_bar = tk.Frame(self.outer_frame, bg=t["bg"], bd=2, relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(2, 4))
+        self.status_label = tk.Label(self.status_bar, textvariable=self.lrc_status_var,
+                                     bg=t["bg"], fg=t["fg"],
+                                     font=self.font_normal, anchor="w")
+        self.status_label.pack(side=tk.LEFT, padx=6, pady=2, fill=tk.X, expand=True)
+
+        self.sync_btn = tk.Button(self.status_bar, text="[ Offline ]", width=14,
+                                  font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
+                                  activebackground=t["btn_active_bg"],
+                                  activeforeground=t["btn_active_fg"],
+                                  relief=tk.RAISED, bd=2, command=self.toggle_sync)
+        self.sync_btn.pack(side=tk.RIGHT, padx=4, pady=2)
+
         # Library / Queue panes
         self.panes = tk.Frame(self.outer_frame, bg=t["bg"])
         self.panes.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        
+        self.visualizer_showing = False
+        self.visualizer = Visualizer(self.outer_frame)
         self.panes.columnconfigure(0, weight=3)
         self.panes.columnconfigure(1, weight=0)
         self.panes.columnconfigure(2, weight=2)
@@ -1058,9 +1514,18 @@ class WaveStackApp(tk.Tk):
         self.vinyl.pack(pady=(14, 6))
 
 
-        # -- Queue pane --
-        self.queue_frame = tk.Frame(self.panes, bg=t["bg"], bd=2, relief=tk.SUNKEN)
-        self.queue_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+        # -- Right column: Queue (top) + CRT Lyrics Terminal (bottom) --
+        # A dedicated container occupies column 2 so both sub-panes can
+        # share vertical space with an equal 50/50 split.
+        self.right_col = tk.Frame(self.panes, bg=t["bg"])
+        self.right_col.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+        self.right_col.rowconfigure(0, weight=1)
+        self.right_col.rowconfigure(1, weight=1)
+        self.right_col.columnconfigure(0, weight=1)
+
+        # Queue sub-pane (top half)
+        self.queue_frame = tk.Frame(self.right_col, bg=t["bg"], bd=2, relief=tk.SUNKEN)
+        self.queue_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 2))
         self.queue_header = tk.Frame(self.queue_frame, bg=t["bg"])
         self.queue_header.pack(fill=tk.X, padx=4, pady=(2, 0))
         self.queue_title_label = tk.Label(self.queue_header, text="Queue",
@@ -1086,23 +1551,26 @@ class WaveStackApp(tk.Tk):
         self.queue_listbox.bind("<Double-Button-1>", self.on_play_from_queue)
         self.queue_listbox.bind("<Button-3>", self.show_queue_context_menu)
 
-        # Status bar
-        self.status_bar = tk.Frame(self.outer_frame, bg=t["bg"], bd=2, relief=tk.SUNKEN)
-        self.status_bar.pack(fill=tk.X, padx=4, pady=(2, 4))
-        self.status_label = tk.Label(self.status_bar, textvariable=self.status_var,
-                                     bg=t["bg"], fg=t["fg"],
-                                     font=self.font_normal, anchor="w")
-        self.status_label.pack(side=tk.LEFT, padx=6, pady=2, fill=tk.X, expand=True)
+        # CRT Lyrics Terminal sub-pane (bottom half)
+        self.lyrics_display = CrtLyricsDisplay(self.right_col)
+        self.lyrics_display.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
 
-    def _on_theme_btn_hover(self, entering):
-        if entering:
-            hint = "Click to toggle Dark Mode" if self.current_theme_name == "light" else "Click to toggle Light Mode"
-            self.status_var.set(hint)
+    def toggle_visualizer(self):
+        if self.visualizer_showing:
+            self.visualizer.pack_forget()
+            self.panes.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+            self.visualizer_showing = False
+            self.visualizer_btn.config(relief=tk.RAISED)
         else:
-            if self.now_playing:
-                self.status_var.set(f"Playing: {os.path.basename(self.now_playing)}")
-            else:
-                self.status_var.set("Ready")
+            self.panes.pack_forget()
+            self.visualizer.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+            self.visualizer_showing = True
+            self.visualizer_btn.config(relief=tk.SUNKEN)
+
+    def _on_global_escape(self, event=None):
+        if getattr(self, "visualizer_showing", False):
+            self.toggle_visualizer()
+            return "break"
 
     def toggle_theme(self):
         new_theme = "dark" if self.current_theme_name == "light" else "light"
@@ -1574,6 +2042,8 @@ class WaveStackApp(tk.Tk):
         self.elapsed_var.set("00:00")
         self.status_var.set("Stopped")
         self._sync_vinyl_spin_state()
+        if hasattr(self, "lyrics_display"):
+            self.lyrics_display.show_stopped()
 
     def on_next_clicked(self):
         self._advance(auto=False)
@@ -1642,6 +2112,8 @@ class WaveStackApp(tk.Tk):
         self._highlight_now_playing()
         if hasattr(self, "vinyl"):
             self.vinyl.load_track(path)  # extracts/caches art once per track
+        if hasattr(self, "lyrics_display"):
+            self.lyrics_display.load_track(path)  # finds & parses .lrc once per track
         self._sync_vinyl_spin_state()
 
         if resume_position and resume_position > 0:
@@ -1800,6 +2272,12 @@ class WaveStackApp(tk.Tk):
         # remembering to sync the vinyl too.
         self._sync_vinyl_spin_state()
 
+        # Push current position into the CRT lyrics terminal every tick
+        # so it scrolls smoothly to the active line.
+        if hasattr(self, "lyrics_display") and self.now_playing and not self.is_stopped:
+            pos_ms = int(self.audio.get_time_seconds() * 1000)
+            self.lyrics_display.sync_to_ms(pos_ms)
+
         self.now_playing_display.tick()
         self._tick_id = self.after(250, self._tick)
 
@@ -1862,6 +2340,96 @@ class WaveStackApp(tk.Tk):
             "no telemetry -- just your local MP3 collection.\n\n"
             "Built with Python, Tkinter and libVLC.")
         RetroDialog(self, "About WaveStack", message, kind="info")
+
+    # -- LRC sync ------------------------------------------------------------
+
+    def toggle_sync(self):
+        self.sync_enabled = not self.sync_enabled
+        if self.sync_enabled:
+            self.sync_btn.config(relief=tk.SUNKEN, text="[ Online Sync ]")
+            self.cancel_sync.clear()
+            if self.sync_thread is None or not self.sync_thread.is_alive():
+                self.sync_thread = threading.Thread(target=self._lrc_sync_worker, daemon=True)
+                self.sync_thread.start()
+        else:
+            self.sync_btn.config(relief=tk.RAISED, text="[ Offline ]")
+            self.cancel_sync.set()
+            self.lrc_status_var.set("No internet access (Offline Mode)")
+
+    def _lrc_sync_worker(self):
+        self.after(0, self.lrc_status_var.set, "Scanning local .lrc files...")
+        
+        # Determine files to scan
+        if self.library_dir:
+            files_to_scan = scan_mp3_files(self.library_dir)
+        else:
+            files_to_scan = self.library_files
+            
+        if not files_to_scan:
+            self.after(0, self.lrc_status_var.set, "No tracks to sync.")
+            return
+
+        missing_lrc = []
+        for mp3_path in files_to_scan:
+            if self.cancel_sync.is_set():
+                return
+            lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+            if not os.path.exists(lrc_path):
+                missing_lrc.append(mp3_path)
+
+        if not missing_lrc:
+            if not self.cancel_sync.is_set():
+                self.after(0, self.lrc_status_var.set, "All available lyrics up to date.")
+            return
+
+        for mp3_path in missing_lrc:
+            if self.cancel_sync.is_set():
+                return
+            
+            title, artist = "", ""
+            if MUTAGEN_AVAILABLE:
+                try:
+                    from mutagen.easyid3 import EasyID3
+                    audio = EasyID3(mp3_path)
+                    title = audio.get("title", [""])[0]
+                    artist = audio.get("artist", [""])[0]
+                except Exception:
+                    pass
+                    
+            if not title:
+                title = os.path.splitext(os.path.basename(mp3_path))[0]
+                
+            display_name = os.path.basename(mp3_path)
+            self.after(0, self.lrc_status_var.set, f"Fetching lyrics: {display_name}...")
+            
+            try:
+                url = f"https://lrclib.net/api/get?track_name={urllib.parse.quote(title)}"
+                if artist:
+                    url += f"&artist_name={urllib.parse.quote(artist)}"
+                    
+                res = requests.get(url, headers={'User-Agent': 'WaveStack/1.0'}, timeout=5)
+                
+                if res.status_code == 200:
+                    data = res.json()
+                    synced = data.get("syncedLyrics")
+                    if synced:
+                        lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+                        try:
+                            with open(lrc_path, "w", encoding="utf-8") as f:
+                                f.write(synced)
+                        except OSError:
+                            pass
+                
+                time.sleep(0.5)
+            except requests.RequestException:
+                if not self.cancel_sync.is_set():
+                    self.after(0, self.lrc_status_var.set, "Rate limit: sync paused")
+                    # Turn off sync automatically if connection fails hard
+                    self.after(0, self.toggle_sync)
+                return
+
+        if not self.cancel_sync.is_set():
+            self.after(0, self.lrc_status_var.set, "All lyrics up to date.")
 
     # -- state persistence ---------------------------------------------------
 
