@@ -35,6 +35,7 @@ import traceback
 import threading
 import urllib.parse
 import requests
+import random
 from io import BytesIO
 import tkinter as tk
 import tkinter.font as tkfont
@@ -170,6 +171,29 @@ CRT_FG_DIM      = "#1A6633"   # dim/inactive lines
 CRT_ACTIVE_BG   = "#00FF66"   # reverse-video highlight background
 CRT_ACTIVE_FG   = "#000000"   # reverse-video highlight foreground (black)
 CRT_BANNER_FG   = "#00AA44"   # slightly dimmer than active, for the title banner
+
+# --------------------------------------------------------------------------
+# Playback modes
+# --------------------------------------------------------------------------
+
+MODE_NORMAL = 0
+MODE_SHUFFLE = 1
+MODE_REPEAT_ONE = 2
+MODE_REPEAT_ALL = 3
+
+MODE_LABELS = {
+    MODE_NORMAL: "[ Normal ]",
+    MODE_SHUFFLE: "[ Shuffle ]",
+    MODE_REPEAT_ONE: "[ Repeat 1 ]",
+    MODE_REPEAT_ALL: "[ Repeat All ]",
+}
+
+MODE_NAMES = {
+    MODE_NORMAL: "Normal",
+    MODE_SHUFFLE: "Shuffle",
+    MODE_REPEAT_ONE: "Repeat One",
+    MODE_REPEAT_ALL: "Repeat All",
+}
 
 SEARCH_PLACEHOLDER_TEXT = "search song"
 SEARCH_PLACEHOLDER_FG = THEMES["light"]["search_placeholder_fg"]
@@ -600,20 +624,23 @@ class VinylDisc(tk.Frame):
         size = self.SIZE
         cx = cy = size / 2
         disc_r = size / 2 - 2
-        label_r = disc_r * 0.36
-        label_d = max(2, int(label_r * 2))
+        disc_d = max(2, int(disc_r * 2))
 
-        art = _crop_to_square(art).resize((label_d, label_d), Image.LANCZOS)
-        mask = _make_circular_mask(label_d)
-        circular_art = Image.new("RGBA", (label_d, label_d), (0, 0, 0, 0))
+        art = _crop_to_square(art).resize((disc_d, disc_d), Image.LANCZOS)
+        mask = _make_circular_mask(disc_d)
+        circular_art = Image.new("RGBA", (disc_d, disc_d), (0, 0, 0, 0))
         circular_art.paste(art, (0, 0), mask)
 
-        combined = self._blank_vinyl.copy()
-        top_left = (int(cx - label_d / 2), int(cy - label_d / 2))
+        combined = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        top_left = (int(cx - disc_r), int(cy - disc_r))
         combined.paste(circular_art, top_left, circular_art)
 
-        # The art circle covers the spindle hole; redraw it on top.
-        self._draw_spindle_hole(ImageDraw.Draw(combined), cx, cy, disc_r)
+        # Draw outer rim highlight and spindle hole on top so it maintains
+        # authentic vinyl record aesthetics (picture disc style).
+        draw = ImageDraw.Draw(combined)
+        draw.ellipse((cx - disc_r, cy - disc_r, cx + disc_r, cy + disc_r),
+                     outline=VINYL_RIM_HIGHLIGHT)
+        self._draw_spindle_hole(draw, cx, cy, disc_r)
         return combined
 
     # -- public API -----------------------------------------------
@@ -753,8 +780,19 @@ class Visualizer(tk.Frame):
         self._segment_ids = [[] for _ in range(self.BAR_COUNT)]
         self._hint_id = None
  
-        self.canvas.bind("<Configure>", lambda e: self._layout())
+        self.canvas.bind("<Configure>", lambda e: self._layout(e.width, e.height))
+        self.canvas.bind("<Escape>", lambda e: self._request_close())
+        self.bind("<Escape>", lambda e: self._request_close())
+        self.canvas.bind("<Button-1>", lambda e: self.canvas.focus_set(), add="+")
         self.after_idle(self._layout)
+
+    def _request_close(self):
+        top = self.winfo_toplevel()
+        if hasattr(top, "_on_global_escape"):
+            top._on_global_escape()
+        elif hasattr(top, "toggle_visualizer"):
+            top.toggle_visualizer()
+        return "break"
  
     def apply_theme(self, theme):
         self.theme = theme
@@ -822,13 +860,15 @@ class Visualizer(tk.Frame):
  
     # -- drawing -----------------------------------------------
  
-    def _layout(self):
+    def _layout(self, width=None, height=None):
         """(Re)builds the LED segment grid to fit the canvas's current
         size. Safe to call on resize: it doesn't touch self._heights,
         it only repositions/recreates the rectangles that display
         them, so a resize never disturbs the running animation."""
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
+        if width is None:
+            width = self.canvas.winfo_width()
+        if height is None:
+            height = self.canvas.winfo_height()
         if width <= 2 or height <= 2:
             return  # not mapped/sized yet (e.g. before it's ever packed)
         self.canvas.delete("all")
@@ -859,6 +899,7 @@ class Visualizer(tk.Frame):
             width // 2, height - hint_h // 2,
             text="Press ESC to return", fill=self.HINT_FG,
             font=("TkDefaultFont", 8))
+        self.canvas.tag_bind(self._hint_id, "<Button-1>", lambda e: self._request_close())
  
         self._render_frame()
  
@@ -1156,6 +1197,8 @@ class WaveStackApp(tk.Tk):
         self.library_files = []
         self.play_queue = []
         self.history = []
+        self.playback_mode = MODE_NORMAL
+        self._shuffle_pool = []
         self.now_playing = None
         self.is_paused = False
         # Tracks the third playback state Stop puts you in, distinct from
@@ -1255,6 +1298,9 @@ class WaveStackApp(tk.Tk):
         playback_menu.add_command(label="Next", command=self.on_next_clicked)
         playback_menu.add_command(label="Previous",
                                    command=self.on_prev_clicked)
+        playback_menu.add_separator()
+        playback_menu.add_command(label="Cycle Playback Mode",
+                                   command=self.cycle_playback_mode)
         self.menubar.add_cascade(label="Playback", menu=playback_menu)
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
@@ -1276,6 +1322,10 @@ class WaveStackApp(tk.Tk):
         self.bind_all("<Control-q>", lambda e: self.on_close())
         self.bind_all("<Control-f>", self._on_focus_search_shortcut)
         self.bind_all("<F10>", lambda e: self.toggle_theme())
+        self.bind_all("<Escape>", self._on_global_escape)
+        self.bind_class("Button", "<Escape>", self._on_global_escape)
+        self.bind_class("Listbox", "<Escape>", self._on_global_escape)
+        self.bind_class("Canvas", "<Escape>", self._on_global_escape)
 
         # Space = play/pause, everywhere. Button and Listbox both ship
         # with their OWN default <space> binding (invoke a focused
@@ -1316,7 +1366,7 @@ class WaveStackApp(tk.Tk):
         )
         self.theme_btn.pack(side=tk.RIGHT, padx=(4, 8), pady=4)
 
-        self.subtitle_label = tk.Label(self.header_frame, text="100% Offline MP3 Player",
+        self.subtitle_label = tk.Label(self.header_frame, text="Offline MP3 Player",
                                        bg=t["bg"], fg=t["fg"],
                                        font=self.font_normal)
         self.subtitle_label.pack(side=tk.RIGHT, padx=10)
@@ -1355,6 +1405,18 @@ class WaveStackApp(tk.Tk):
         self.visualizer_btn = make_button(self.transport_frame, "Audio Visualizer",
                                           self.toggle_visualizer)
         self.visualizer_btn.pack(side=tk.LEFT, padx=(10, 3), pady=3)
+
+        self.mode_btn = tk.Button(self.transport_frame,
+                                  text=MODE_LABELS[self.playback_mode],
+                                  command=self.cycle_playback_mode,
+                                  width=14,
+                                  font=self.font_bold,
+                                  bg=t["btn_bg"], fg=t["btn_fg"],
+                                  relief=tk.RAISED, bd=2,
+                                  activebackground=t["btn_active_bg"],
+                                  activeforeground=t["btn_active_fg"],
+                                  padx=6)
+        self.mode_btn.pack(side=tk.LEFT, padx=3, pady=3)
 
         self.open_folder_btn = make_button(self.transport_frame, "Open Folder...",
                                             self.on_open_folder)
@@ -1405,7 +1467,7 @@ class WaveStackApp(tk.Tk):
                                      font=self.font_normal, anchor="w")
         self.status_label.pack(side=tk.LEFT, padx=6, pady=2, fill=tk.X, expand=True)
 
-        self.sync_btn = tk.Button(self.status_bar, text="[ Offline ]", width=14,
+        self.sync_btn = tk.Button(self.status_bar, text="[ Go Online ]", width=14,
                                   font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
                                   activebackground=t["btn_active_bg"],
                                   activeforeground=t["btn_active_fg"],
@@ -1418,6 +1480,7 @@ class WaveStackApp(tk.Tk):
         
         self.visualizer_showing = False
         self.visualizer = Visualizer(self.outer_frame)
+        self.visualizer.set_volume(70)
         self.panes.columnconfigure(0, weight=3)
         self.panes.columnconfigure(1, weight=0)
         self.panes.columnconfigure(2, weight=2)
@@ -1561,11 +1624,18 @@ class WaveStackApp(tk.Tk):
             self.panes.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
             self.visualizer_showing = False
             self.visualizer_btn.config(relief=tk.RAISED)
+            if hasattr(self, "library_listbox"):
+                self.library_listbox.focus_set()
         else:
             self.panes.pack_forget()
             self.visualizer.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
             self.visualizer_showing = True
             self.visualizer_btn.config(relief=tk.SUNKEN)
+            self.update_idletasks()
+            self.visualizer._layout()
+            self.visualizer.focus_set()
+            self.visualizer.canvas.focus_set()
+            self._sync_vinyl_spin_state()
 
     def _on_global_escape(self, event=None):
         if getattr(self, "visualizer_showing", False):
@@ -1634,6 +1704,8 @@ class WaveStackApp(tk.Tk):
                     getattr(self, "pause_btn", None),
                     getattr(self, "stop_btn", None),
                     getattr(self, "next_btn", None),
+                    getattr(self, "visualizer_btn", None),
+                    getattr(self, "mode_btn", None),
                     getattr(self, "open_folder_btn", None)):
             if btn:
                 btn.configure(
@@ -1726,7 +1798,13 @@ class WaveStackApp(tk.Tk):
         if hasattr(self, "vinyl"):
             self.vinyl.apply_theme(t)
 
+        # Visualizer widget
+        if hasattr(self, "visualizer"):
+            self.visualizer.apply_theme(t)
+
         # Queue
+        if hasattr(self, "right_col"):
+            self.right_col.configure(bg=t["bg"])
         if hasattr(self, "queue_frame"):
             self.queue_frame.configure(bg=t["bg"])
         if hasattr(self, "queue_header"):
@@ -1773,6 +1851,7 @@ class WaveStackApp(tk.Tk):
             return False
         self.library_dir = directory
         self.library_files = files
+        self._shuffle_pool = []
         self.refresh_library_listbox()
         self.status_var.set(f"Loaded {len(files)} track(s) from {directory}")
         return True
@@ -1991,18 +2070,29 @@ class WaveStackApp(tk.Tk):
         return "break"
 
     def _sync_vinyl_spin_state(self):
-        """Drives the vinyl widget from the same three-state model
-        (playing / paused / stopped-or-nothing) used everywhere else
-        in the app, e.g. on_play_pause_toggle(). Cheap and idempotent,
-        so it's safe to call from every place playback state changes
-        without worrying about redundant calls."""
+        """Drives both the vinyl widget and the simulated audio visualizer
+        from the same three-state model (playing / paused / stopped-or-nothing)
+        used everywhere else in the app."""
+        is_playing = bool(self.now_playing and not self.is_paused and not self.is_stopped)
+        is_paused = bool(self.now_playing and self.is_paused)
+
         if hasattr(self, "vinyl"):
-            if self.now_playing and not self.is_paused and not self.is_stopped:
+            if is_playing:
                 self.vinyl.start_spinning()
-            elif self.now_playing and self.is_paused:
+            elif is_paused:
                 self.vinyl.pause_spinning()
             else:
                 self.vinyl.stop_and_reset()
+
+        if hasattr(self, "visualizer"):
+            if is_playing:
+                self.visualizer.start_animating()
+            elif is_paused:
+                self.visualizer.pause_animating()
+            else:
+                self.visualizer.stop_and_reset()
+
+    _sync_playback_visuals = _sync_vinyl_spin_state
 
     def on_play_clicked(self):
         if self.is_paused and self.now_playing:
@@ -2045,6 +2135,35 @@ class WaveStackApp(tk.Tk):
         if hasattr(self, "lyrics_display"):
             self.lyrics_display.show_stopped()
 
+    def cycle_playback_mode(self):
+        self.playback_mode = (self.playback_mode + 1) % 4
+        if hasattr(self, "mode_btn"):
+            self.mode_btn.config(text=MODE_LABELS[self.playback_mode])
+        self.status_var.set(f"Playback mode: {MODE_NAMES[self.playback_mode]}")
+        if self.playback_mode == MODE_SHUFFLE:
+            self._reset_shuffle_pool()
+
+    def _reset_shuffle_pool(self):
+        if not self.library_files:
+            self._shuffle_pool = []
+            return
+        if len(self.library_files) > 1 and self.now_playing in self.library_files:
+            self._shuffle_pool = [p for p in self.library_files if p != self.now_playing]
+        else:
+            self._shuffle_pool = list(self.library_files)
+
+    def _next_shuffle_track(self):
+        if not self.library_files:
+            return None
+        self._shuffle_pool = [p for p in self._shuffle_pool if p in self.library_files]
+        if not self._shuffle_pool:
+            self._reset_shuffle_pool()
+        if not self._shuffle_pool:
+            return None
+        chosen = random.choice(self._shuffle_pool)
+        self._shuffle_pool.remove(chosen)
+        return chosen
+
     def on_next_clicked(self):
         self._advance(auto=False)
 
@@ -2053,14 +2172,39 @@ class WaveStackApp(tk.Tk):
             path = self.history.pop()
             self._play_path(path)
         else:
+            if self.library_files and self.now_playing in self.library_files:
+                idx = self.library_files.index(self.now_playing)
+                if idx > 0:
+                    self._play_path(self.library_files[idx - 1])
+                    return
+                elif self.playback_mode == MODE_REPEAT_ALL:
+                    self._play_path(self.library_files[-1])
+                    return
             self.status_var.set("No previous track.")
 
-    def _advance(self, auto=False):
-        if self.play_queue:
-            next_path = self.play_queue.pop(0)
-            self.refresh_queue_listbox()
+    def _advance(self, auto=False, force_next=False):
+        # Repeat One: replay the exact same track when reaching end,
+        # unless forced to skip on error or triggered manually by Next.
+        if auto and not force_next and self.playback_mode == MODE_REPEAT_ONE:
+            if self.now_playing and os.path.isfile(self.now_playing):
+                self._play_path(self.now_playing)
+                return
+
+        # Pick next track based on mode and queue
+        if self.playback_mode == MODE_SHUFFLE:
+            if self.play_queue:
+                idx = random.randrange(len(self.play_queue))
+                next_path = self.play_queue.pop(idx)
+                self.refresh_queue_listbox()
+            else:
+                next_path = self._next_shuffle_track()
         else:
-            next_path = self._next_in_library()
+            if self.play_queue:
+                next_path = self.play_queue.pop(0)
+                self.refresh_queue_listbox()
+            else:
+                next_path = self._next_in_library()
+
         if next_path:
             self._play_path(next_path)
         else:
@@ -2075,6 +2219,8 @@ class WaveStackApp(tk.Tk):
             idx = self.library_files.index(self.now_playing)
             if idx + 1 < len(self.library_files):
                 return self.library_files[idx + 1]
+            if self.playback_mode == MODE_REPEAT_ALL:
+                return self.library_files[0]
             return None
         return self.library_files[0]
 
@@ -2087,7 +2233,7 @@ class WaveStackApp(tk.Tk):
         if not os.path.isfile(path):
             self.show_retro_error("File Not Found",
                                    f"This file no longer exists:\n{path}")
-            self._advance(auto=True)
+            self._advance(auto=True, force_next=True)
             return
         if self.now_playing and self.now_playing != path:
             self.history.append(self.now_playing)
@@ -2098,7 +2244,7 @@ class WaveStackApp(tk.Tk):
             self.show_retro_error(
                 "Playback Error",
                 f"Could not play:\n{os.path.basename(path)}\n\n{exc}")
-            self._advance(auto=True)
+            self._advance(auto=True, force_next=True)
             return
         self.now_playing = path
         self.is_paused = False
@@ -2106,6 +2252,9 @@ class WaveStackApp(tk.Tk):
         self._known_length = 0.0
         self.seek_scale.config(to=100)
         self.seek_scale.set(0)
+        self.elapsed_var.set("00:00")
+        if self._shuffle_pool and path in self._shuffle_pool:
+            self._shuffle_pool.remove(path)
         self.now_playing_display.set_text(
             os.path.splitext(os.path.basename(path))[0])
         self.status_var.set(f"Playing: {os.path.basename(path)}")
@@ -2223,7 +2372,10 @@ class WaveStackApp(tk.Tk):
     # -- volume / seeking ---------------------------------------------------
 
     def on_volume_changed(self, value):
-        self.audio.set_volume(int(float(value)))
+        val = int(float(value))
+        self.audio.set_volume(val)
+        if hasattr(self, "visualizer"):
+            self.visualizer.set_volume(val)
 
     def _on_seek_press(self, event):
         self._user_seeking = True
@@ -2322,7 +2474,7 @@ class WaveStackApp(tk.Tk):
         name = os.path.basename(self.now_playing) if self.now_playing \
             else "track"
         self.status_var.set(f"Could not play {name}, skipping...")
-        self._advance(auto=True)
+        self._advance(auto=True, force_next=True)
 
     # -- dialogs ---------------------------------------------------
 
@@ -2506,6 +2658,8 @@ class WaveStackApp(tk.Tk):
                     pass
         if hasattr(self, "vinyl"):
             self.vinyl.shutdown()
+        if hasattr(self, "visualizer"):
+            self.visualizer.shutdown()
         self.save_state()
         self.audio.release()
         self.destroy()
