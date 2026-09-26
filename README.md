@@ -21,29 +21,37 @@ No telemetry, no analytics, and no mandatory cloud connections. Just your local 
 
 ## Requirements
 
-* Ubuntu 26.04 (or any modern Linux desktop running GNOME/KDE)
-* Python 3.8+
-* VLC (`libvlc`) -> the audio engine
-* Tkinter (`python3-tk`) -> the GUI toolkit
+WaveStack supports modern Linux desktops, including:
+
+* **Debian-based:** Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin OS, elementary OS
+* **Fedora/RHEL-based:** Fedora, RHEL, Rocky Linux, AlmaLinux
+* **Arch-based:** Arch Linux, Manjaro, EndeavourOS, Garuda Linux
+* **openSUSE**
+
+For the first launch, you need:
+
+* An internet connection
+* `sudo` access to install VLC, Python, Tkinter, and Python virtual-environment support
+* The complete WaveStack project folder containing `wavestack.py`, `requirements.txt`, and `run.sh`
 
 ## Quick Start
 
+Open a terminal inside the WaveStack project folder, make the launcher executable, and run it:
+
 ```bash
-mkdir -p ~/WaveStack && cd ~/WaveStack
-# copy wavestack.py, requirements.txt, run.sh, and WaveStack.desktop here
-
-sudo apt update && sudo apt install -y python3-venv python3-tk vlc
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-chmod +x wavestack.py run.sh
-
-mkdir -p ~/.local/share/applications
-cp WaveStack.desktop ~/.local/share/applications/
-update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
-
+chmod +x run.sh
+./run.sh
 ```
 
-WaveStack should now appear in your app launcher — search for "WaveStack". See **SETUP.md** for the same steps with an explanation of what each one does and how to undo it.
+On its first run, WaveStack automatically:
+
+1. Detects your Linux distribution and package manager.
+2. Installs VLC, Python, Tkinter, and virtual-environment support.
+3. Creates WaveStack's private Python environment and installs its dependencies.
+4. Adds WaveStack to your app launcher and places a clickable desktop icon in your Desktop folder.
+5. Starts the player.
+
+After setup, start WaveStack by clicking its desktop icon or searching for **WaveStack** in your system app launcher. No commands are needed after each boot.
 
 ## Usage
 
