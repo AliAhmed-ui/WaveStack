@@ -4,6 +4,10 @@ A fully offline-first, 1990s-styled MP3 player for Linux desktops, built with Py
 
 No telemetry, no analytics, and no mandatory cloud connections. Just your local MP3 collection styled like it's 1996, featuring an opt-in hardware-style toggle to fetch synchronized lyrics only when you explicitly allow it.
 
+## Screenshot
+
+![WaveStack screenshot](screenshot.png)
+
 ## Features
 
 * **Strict retro aesthetic** thick raised/sunken borders, classic gray (`#C0C0C0`) chrome, monospace fonts, and a scrolling green LCD "now playing" marquee, all built from classic Tkinter widgets (not a themed skin, so it doesn't inherit your desktop's modern GTK/Qt look).
