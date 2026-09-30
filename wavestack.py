@@ -2670,14 +2670,22 @@ class WaveStackApp(tk.Tk):
 # --------------------------------------------------------------------------
 
 def _fatal_startup_error(message):
-    root = tk.Tk()
-    root.withdraw()
-    RetroDialog(root, "WaveStack - Startup Error", message, kind="error")
-    root.destroy()
+    sys.stderr.write(f"\n[WaveStack Startup Error]\n{message}\n\n")
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        RetroDialog(root, "WaveStack - Startup Error", message, kind="error")
+        root.destroy()
+    except Exception:
+        pass
 
 
 def main():
+    global vlc
     if vlc is None:
+        venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
+        if os.path.isfile(venv_python) and sys.executable != venv_python:
+            os.execv(venv_python, [venv_python] + sys.argv)
         _fatal_startup_error(
             "WaveStack could not start because the 'python-vlc' package "
             "is not installed.\n\nActivate your virtual environment and "
