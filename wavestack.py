@@ -33,6 +33,10 @@ import time
 import queue
 import traceback
 import threading
+import hashlib
+import shutil
+import subprocess
+import collections
 import urllib.parse
 import requests
 import random
@@ -55,9 +59,17 @@ except ImportError:
 try:
     from mutagen.id3 import ID3
     from mutagen.easyid3 import EasyID3
+    from mutagen.mp3 import MP3
     MUTAGEN_AVAILABLE = True
 except ImportError:
     MUTAGEN_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
 
 
 
@@ -80,6 +92,46 @@ STATE_FILE = os.path.expanduser("~/.config/wavestack/state.json")
 # playing, as a safety net against the app being force-killed instead
 # of closed normally. A graceful close always saves immediately.
 AUTOSAVE_INTERVAL_SECONDS = 5
+
+# --------------------------------------------------------------------------
+# Genre tree / AUTO-SORT
+# --------------------------------------------------------------------------
+
+# The six "core" genres the offline DSP classifier can assign, in the
+# order their folders appear in the Library tree. A genre read from an
+# ID3 tag that doesn't normalise to one of these (e.g. "Latin") keeps
+# its own folder, listed alphabetically after the core ones.
+GENRE_HIPHOP = "Hip-Hop"
+GENRE_ELECTRONIC = "Electronic"
+GENRE_ROCK = "Rock"
+GENRE_POP = "Pop"
+GENRE_RNB = "R&B / Chill"
+GENRE_ACOUSTIC = "Acoustic / Instrumental"
+GENRE_UNSORTED = "Unsorted / Untagged"
+
+GENRE_ORDER = [GENRE_HIPHOP, GENRE_ELECTRONIC, GENRE_ROCK, GENRE_POP,
+               GENRE_RNB, GENRE_ACOUSTIC]
+
+# Key used in visual_row_map for the "[-] All Music (Library)" root row.
+# Deliberately not a string any real genre tag could normalise to.
+TREE_ROOT_KEY = "\x00root"
+TREE_ROOT_LABEL = "All Music (Library)"
+
+# Classified genres are cached here, inside the music folder itself, so
+# a re-scan is avoided across sessions (and the cache travels with the
+# folder). If that folder isn't writable, the cache falls back to
+# GENRE_CACHE_FALLBACK_DIR instead.
+GENRE_CACHE_NAME = ".wavestack_genres.json"
+GENRE_CACHE_FALLBACK_DIR = os.path.expanduser("~/.config/wavestack/genres")
+
+# The DSP stage decodes this many seconds of mono PCM, starting this far
+# into the track (to skip quiet intros), at this sample rate.
+DSP_SAMPLE_RATE = 22050
+DSP_SLICE_SECONDS = 10
+DSP_SLICE_OFFSET_SECONDS = 30
+
+# How often (ms) the main thread drains the AUTO-SORT worker's queue.
+AUTOSORT_POLL_MS = 150
 
 # --------------------------------------------------------------------------
 # Retro color palettes (Light = Classic Windows 95 / Motif; Dark = Retro Noir)
@@ -195,14 +247,20 @@ MODE_NAMES = {
     MODE_REPEAT_ALL: "Repeat All",
 }
 
+# Lower-pane layout: how many tracks the Queue list shows without
+# scrolling, and the least height (px) the lyrics terminal below it is
+# squeezed to in a small window.
+QUEUE_VISIBLE_ROWS = 7
+LYRICS_MIN_HEIGHT = 80
+
 SEARCH_PLACEHOLDER_TEXT = "search song"
 SEARCH_PLACEHOLDER_FG = THEMES["light"]["search_placeholder_fg"]
 SEARCH_NORMAL_FG = THEMES["light"]["search_normal_fg"]
 
 # Keys that change the search entry's cursor position or invoke a
-# specific search action, but don't change its text -- recomputing
-# suggestions on these would be wasted work, and for Down/Up it would
-# actively fight the dropdown navigation below.
+# specific search action, but don't change its text -- re-filtering
+# the Library tree on these would be wasted work, and for Down/Up it
+# would actively fight the match navigation below.
 _SEARCH_NON_TEXT_KEYSYMS = {
     "Down", "Up", "Return", "KP_Enter", "Escape", "Tab",
     "Left", "Right", "Home", "End",
@@ -365,6 +423,789 @@ def parse_lrc(filepath):
 
     entries.sort(key=lambda x: x[0])
     return entries
+
+
+# --------------------------------------------------------------------------
+# Offline genre classification (AUTO-SORT)
+#
+# Three stages, cheapest first, all local -- nothing here touches the
+# network:
+#   1. Metadata:   the file's own ID3 TCON genre tag, normalised.
+#   2. Tokens:     artist / filename tokens cross-referenced against
+#                  tracks whose genre is already known.
+#   3. DSP:        a 10s PCM slice decoded by ffmpeg and analysed with
+#                  numpy (sub-bass ratio, spectral centroid, zero-crossing
+#                  rate, onset pulse) -- a heuristic, not a trained model.
+#
+# Everything in this section is plain functions with no Tkinter access,
+# so it is safe to run on the AUTO-SORT worker thread.
+# --------------------------------------------------------------------------
+
+# Checked top to bottom, first hit wins, so "pop rap" lands in Hip-Hop
+# and "indie pop" in Pop rather than Rock. Keywords only match as whole
+# words ("rap" must not match "therapy").
+_GENRE_KEYWORDS = [
+    (GENRE_HIPHOP, ("hip hop", "hip-hop", "hiphop", "rap", "trap", "drill",
+                    "grime", "boom bap", "crunk")),
+    (GENRE_RNB, ("r&b", "rnb", "r & b", "r'n'b", "rhythm and blues", "soul",
+                 "neo soul", "chill", "chillout", "lo-fi", "lofi",
+                 "downtempo", "ambient", "trip hop", "trip-hop", "funk",
+                 "reggae")),
+    (GENRE_ELECTRONIC, ("electronic", "electronica", "electro", "edm",
+                        "house", "techno", "trance", "dubstep",
+                        "drum and bass", "drum & bass", "dnb", "garage",
+                        "synth", "synthpop", "synthwave", "electropop",
+                        "dance", "idm", "hardstyle", "breakbeat", "disco")),
+    (GENRE_ROCK, ("rock", "metal", "punk", "grunge", "hardcore")),
+    (GENRE_POP, ("pop", "k-pop", "j-pop", "kpop", "jpop")),
+    (GENRE_ROCK, ("indie", "alternative", "emo")),
+    (GENRE_ACOUSTIC, ("acoustic", "instrumental", "classical", "folk",
+                      "jazz", "soundtrack", "score", "piano", "orchestral",
+                      "orchestra", "blues", "country", "singer-songwriter",
+                      "new age", "opera")),
+]
+
+_GENRE_KEYWORD_PATTERNS = [
+    (genre, re.compile(
+        r"(?<![a-z0-9])(?:" + "|".join(re.escape(k) for k in keywords)
+        + r")(?![a-z0-9])"))
+    for genre, keywords in _GENRE_KEYWORDS
+]
+
+# Tag values that mean "nobody filled this in", not an actual genre.
+_GENRE_PLACEHOLDERS = {"", "other", "unknown", "none", "misc", "genre",
+                       "default", "n/a", "na", "undefined"}
+
+
+def normalize_genre(raw):
+    """Map a raw genre string to a folder name: one of the core genres
+    if it's recognisably one of them ("Rap", "Trap" -> "Hip-Hop"),
+    otherwise the tidied-up tag itself. Returns None for an empty or
+    placeholder tag."""
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = " ".join(raw.replace("\x00", " ").split())
+    lowered = cleaned.lower()
+    if lowered in _GENRE_PLACEHOLDERS or lowered == GENRE_UNSORTED.lower():
+        return None
+    for genre, pattern in _GENRE_KEYWORD_PATTERNS:
+        if pattern.search(lowered):
+            return genre
+    return cleaned[:40]
+
+
+def read_track_tags(filepath):
+    """Return (raw_genre_or_None, [artist strings]) from *filepath*'s
+    own ID3 tag. Never raises; an untagged or corrupt file just yields
+    (None, [])."""
+    if not MUTAGEN_AVAILABLE:
+        return None, []
+    try:
+        tags = ID3(filepath)
+    except Exception:
+        return None, []
+    genre = None
+    artists = []
+    try:
+        for frame in tags.getall("TCON"):
+            # .genres resolves ID3v1-style numeric references like "(17)"
+            for value in (getattr(frame, "genres", None) or frame.text):
+                if value and normalize_genre(str(value)):
+                    genre = str(value)
+                    break
+            if genre:
+                break
+        for frame_id in ("TPE1", "TPE2"):
+            for frame in tags.getall(frame_id):
+                artists.extend(str(t) for t in frame.text if t)
+    except Exception:
+        pass
+    return genre, artists
+
+
+_ARTIST_SPLIT_RE = re.compile(
+    r"\s*(?:/|,|;|&|\bfeat(?:uring)?\b\.?|\bft\b\.?)\s*", re.IGNORECASE)
+_NON_TOKEN_RE = re.compile(r"[^a-z0-9$']+")
+
+
+def _normalize_token_text(text):
+    """Lowercase *text* and collapse every run of punctuation/separators
+    to a single space, so "Don-Toliver", "Don_Toliver" and "Don Toliver"
+    all compare equal."""
+    return _NON_TOKEN_RE.sub(" ", text.lower()).strip()
+
+
+def _split_artist_names(text):
+    names = []
+    for part in _ARTIST_SPLIT_RE.split(text):
+        name = _normalize_token_text(part)
+        if len(name) >= 3 and name not in names:
+            names.append(name)
+    return names
+
+
+def build_track_identity(filepath, tag_artists):
+    """Return (artist_names, searchable_text) for token propagation.
+
+    artist_names come from the ID3 artist tag and, when the filename
+    follows the common "Artist - Title" shape, from its prefix too.
+    searchable_text is the normalised artist tags plus filename, padded
+    with spaces so whole-phrase containment is a plain substring test."""
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    names = []
+    for artist in tag_artists:
+        for name in _split_artist_names(artist):
+            if name not in names:
+                names.append(name)
+    spaced = stem.replace("_", " ")
+    if " - " in spaced:
+        for name in _split_artist_names(spaced.split(" - ", 1)[0]):
+            if name not in names:
+                names.append(name)
+    text = _normalize_token_text(" ".join(tag_artists) + " " + stem)
+    return names, f" {text} "
+
+
+def propagate_genres_by_tokens(pending, resolved, identities, cancel):
+    """Stage 2. Assign genres to *pending* paths by cross-referencing
+    their artist names / filename tokens against tracks in *resolved*
+    ({path: genre}). Runs repeated passes, so a collaborator who only
+    becomes "known" in one pass can resolve further tracks in the next.
+    Returns {path: genre} for the newly resolved tracks."""
+    newly = {}
+    known = dict(resolved)
+    remaining = [p for p in pending if p not in known]
+    for _pass in range(6):
+        if not remaining or cancel.is_set():
+            break
+        artist_votes = collections.defaultdict(collections.Counter)
+        known_texts = []
+        for path, genre in known.items():
+            names, text = identities.get(path, ([], " "))
+            known_texts.append((text, genre))
+            for name in names:
+                artist_votes[name][genre] += 1
+        progressed = []
+        for path in remaining:
+            if cancel.is_set():
+                break
+            names, text = identities.get(path, ([], " "))
+            votes = collections.Counter()
+            for name in names:
+                if name in artist_votes:
+                    votes.update(artist_votes[name])
+                else:
+                    # This track's artist, mentioned in a known track's
+                    # filename/tags (e.g. as a "Ft-" guest).
+                    needle = f" {name} "
+                    for known_text, genre in known_texts:
+                        if needle in known_text:
+                            votes[genre] += 1
+            if not votes:
+                # A known artist's name appearing in this file's name.
+                for name, counts in artist_votes.items():
+                    if f" {name} " in text:
+                        votes.update(counts)
+            if votes:
+                progressed.append((path, votes.most_common(1)[0][0]))
+        if not progressed:
+            break
+        for path, genre in progressed:
+            known[path] = genre
+            newly[path] = genre
+        done = {p for p, _g in progressed}
+        remaining = [p for p in remaining if p not in done]
+    return newly
+
+
+def decode_pcm_slice(filepath, ffmpeg_path):
+    """Decode a short mono slice of *filepath* to float samples in
+    [-1, 1] via an ffmpeg subprocess. Returns a numpy array, or None if
+    the file can't be decoded. Tries DSP_SLICE_OFFSET_SECONDS in first;
+    falls back to the very start for tracks shorter than that."""
+    for offset in (DSP_SLICE_OFFSET_SECONDS, 0):
+        cmd = [ffmpeg_path, "-nostdin", "-v", "error",
+               "-ss", str(offset), "-t", str(DSP_SLICE_SECONDS),
+               "-i", filepath, "-vn", "-ac", "1",
+               "-ar", str(DSP_SAMPLE_RATE), "-f", "s16le", "-"]
+        try:
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        raw = proc.stdout or b""
+        raw = raw[:len(raw) - (len(raw) % 2)]
+        if len(raw) // 2 >= DSP_SAMPLE_RATE * 3:   # at least 3s of audio
+            return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    return None
+
+
+def extract_dsp_features(samples, sample_rate=DSP_SAMPLE_RATE):
+    """Compute the handful of spectral/rhythm features the heuristic
+    classifier uses. Returns a dict, or None for silence / too little
+    audio.
+
+      sub_bass    share of spectral power in 20-150 Hz
+      centroid    mean spectral centroid in Hz ("brightness")
+      zcr         zero-crossing rate per sample ("noisiness")
+      pulse       0..1 strength of the steadiest beat period, from the
+                  autocorrelation of the onset envelope
+      onset_rate  detected onsets per second
+      tempo       BPM of that steadiest period (octave-ambiguous)
+    """
+    n_fft, hop = 2048, 512
+    if samples is None or len(samples) < n_fft * 8:
+        return None
+    if float(np.sqrt(np.mean(samples ** 2))) < 1e-4:
+        return None  # digital silence
+
+    n_frames = 1 + (len(samples) - n_fft) // hop
+    index = (np.arange(n_fft)[None, :]
+             + hop * np.arange(n_frames)[:, None])
+    mag = np.abs(np.fft.rfft(samples[index] * np.hanning(n_fft), axis=1))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+
+    power = (mag ** 2).mean(axis=0)
+    total_power = float(power[freqs >= 20].sum())
+    if total_power <= 0:
+        return None
+    sub_bass = float(power[(freqs >= 20) & (freqs <= 150)].sum()) / total_power
+
+    frame_energy = mag.sum(axis=1)
+    loud = frame_energy > 0.1 * frame_energy.mean()
+    if not loud.any():
+        return None
+    centroid = float(((mag[loud] * freqs).sum(axis=1)
+                      / frame_energy[loud]).mean())
+
+    signs = np.signbit(samples)
+    zcr = float(np.mean(signs[1:] != signs[:-1]))
+
+    # Onset envelope: positive spectral flux on a log-compressed
+    # spectrum, so a kick drum and a hi-hat both register.
+    log_mag = np.log1p(1000.0 * mag / (mag.max() + 1e-12))
+    flux = np.maximum(0.0, np.diff(log_mag, axis=0)).sum(axis=1)
+    envelope = flux - flux.mean()
+    spread = float(envelope.std())
+    pulse, onset_rate, tempo = 0.0, 0.0, 0.0
+    if spread > 0 and len(envelope) > 64:
+        mid = envelope[1:-1]
+        peaks = ((mid > envelope[:-2]) & (mid >= envelope[2:])
+                 & (mid > 0.5 * spread))
+        onset_rate = float(peaks.sum()) / (len(samples) / sample_rate)
+        autocorr = np.correlate(envelope, envelope, mode="full")[
+            len(envelope) - 1:]
+        frames_per_second = sample_rate / hop
+        lag_min = max(1, int(frames_per_second * 60 / 200))   # 200 BPM
+        lag_max = min(len(autocorr) - 1,
+                      int(frames_per_second * 60 / 60))       # 60 BPM
+        if autocorr[0] > 0 and lag_max > lag_min:
+            window = autocorr[lag_min:lag_max + 1]
+            best = int(np.argmax(window))
+            pulse = float(min(1.0, max(0.0, window[best] / autocorr[0])))
+            tempo = 60.0 * frames_per_second / (lag_min + best)
+
+    return {"sub_bass": sub_bass, "centroid": centroid, "zcr": zcr,
+            "pulse": pulse, "onset_rate": onset_rate, "tempo": tempo}
+
+
+# Per-genre feature "prototypes" as (typical value, tolerance). A track
+# is assigned the genre whose prototype it sits closest to, measured in
+# tolerances. These are hand-set rules of thumb about how each genre is
+# usually mixed -- booming sub-bass for hip-hop, bright noisy guitars
+# for rock, a rigid pulse for electronic -- not learned parameters.
+_DSP_PROTOTYPES = {
+    #                   sub_bass      centroid      zcr            pulse        onset_rate
+    GENRE_HIPHOP:     ((0.70, 0.18), (2500, 700), (0.085, 0.040), (0.47, 0.18), (4.7, 1.2)),
+    GENRE_ELECTRONIC: ((0.40, 0.15), (2800, 800), (0.100, 0.040), (0.72, 0.15), (5.5, 1.5)),
+    GENRE_ROCK:       ((0.12, 0.10), (2900, 700), (0.130, 0.040), (0.30, 0.20), (4.5, 1.5)),
+    GENRE_POP:        ((0.28, 0.12), (2600, 600), (0.100, 0.035), (0.45, 0.20), (4.5, 1.5)),
+    GENRE_RNB:        ((0.45, 0.15), (1700, 500), (0.050, 0.025), (0.35, 0.20), (3.2, 1.2)),
+    GENRE_ACOUSTIC:   ((0.06, 0.08), (1500, 700), (0.050, 0.030), (0.15, 0.15), (2.5, 1.5)),
+}
+_DSP_FEATURE_ORDER = ("sub_bass", "centroid", "zcr", "pulse", "onset_rate")
+
+
+def classify_dsp_features(features):
+    """Stage 3's decision: the core genre whose prototype is nearest."""
+    best_genre, best_distance = None, None
+    for genre in GENRE_ORDER:
+        distance = 0.0
+        for name, (typical, tolerance) in zip(_DSP_FEATURE_ORDER,
+                                              _DSP_PROTOTYPES[genre]):
+            distance += ((features[name] - typical) / tolerance) ** 2
+        if best_distance is None or distance < best_distance:
+            best_genre, best_distance = genre, distance
+    return best_genre
+
+
+def _genre_cache_paths(directory):
+    """The cache file inside the music folder, then the per-folder
+    fallback under ~/.config for folders that aren't writable."""
+    digest = hashlib.md5(
+        os.path.abspath(directory).encode("utf-8", "replace")).hexdigest()
+    return [os.path.join(directory, GENRE_CACHE_NAME),
+            os.path.join(GENRE_CACHE_FALLBACK_DIR, digest + ".json")]
+
+
+def load_genre_cache(directory):
+    """Return {mp3 filename: {"genre": str, "source": str}} for
+    *directory*. Never raises; a missing or corrupt cache is just empty."""
+    if not directory:
+        return {}
+    for path in _genre_cache_paths(directory):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            tracks = data.get("tracks") if isinstance(data, dict) else None
+            if not isinstance(tracks, dict):
+                continue
+            return {
+                name: {"genre": rec["genre"],
+                       "source": str(rec.get("source", ""))}
+                for name, rec in tracks.items()
+                if isinstance(name, str) and isinstance(rec, dict)
+                and isinstance(rec.get("genre"), str) and rec["genre"]
+            }
+        except Exception:
+            continue
+    return {}
+
+
+def save_genre_cache(directory, cache):
+    """Best-effort write of the genre cache; returns True on success."""
+    if not directory:
+        return False
+    payload = {"version": 1, "tracks": cache}
+    for path in _genre_cache_paths(directory):
+        tmp_path = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return False
+
+
+def run_autosort_worker(files, known, out, cancel):
+    """AUTO-SORT background thread body.
+
+    *files* is the flat list of library paths, *known* is {path: genre}
+    for tracks already classified (from the cache). Never touches
+    Tkinter: results are reported only by putting tuples on *out*, which
+    the main thread drains from WaveStackApp._poll_autosort:
+
+      ("progress", stage_label, done, total)
+      ("genre", path, genre, source)        source: id3 / tokens / dsp
+      ("done", stats_dict)
+
+    If *cancel* is set the worker just returns without a "done"."""
+    stats = {"id3": 0, "tokens": 0, "dsp": 0, "unsorted": 0, "note": ""}
+    try:
+        resolved = dict(known)
+        identities = {}
+
+        # Stage 1: embedded ID3 genre tags. Artists are read for every
+        # track, including already-known ones, because stage 2 needs
+        # them as its reference set.
+        total = len(files)
+        for i, path in enumerate(files):
+            if cancel.is_set():
+                return
+            raw_genre, artists = read_track_tags(path)
+            identities[path] = build_track_identity(path, artists)
+            if path not in resolved:
+                genre = normalize_genre(raw_genre)
+                if genre:
+                    resolved[path] = genre
+                    stats["id3"] += 1
+                    out.put(("genre", path, genre, "id3"))
+            out.put(("progress", "ID3", i + 1, total))
+
+        # Stage 2: token propagation from known tracks.
+        pending = [p for p in files if p not in resolved]
+        if pending and resolved:
+            out.put(("progress", "TOKENS", 0, len(pending)))
+            found = propagate_genres_by_tokens(pending, resolved,
+                                               identities, cancel)
+            if cancel.is_set():
+                return
+            for path, genre in found.items():
+                resolved[path] = genre
+                stats["tokens"] += 1
+                out.put(("genre", path, genre, "tokens"))
+            out.put(("progress", "TOKENS", len(found), len(pending)))
+
+        # Stage 3: spectral analysis of whatever is still unknown.
+        pending = [p for p in files if p not in resolved]
+        if pending:
+            ffmpeg_path = shutil.which("ffmpeg")
+            if not NUMPY_AVAILABLE:
+                stats["note"] = "DSP skipped: numpy not installed"
+            elif not ffmpeg_path:
+                stats["note"] = "DSP skipped: ffmpeg not installed"
+            else:
+                total = len(pending)
+                for i, path in enumerate(pending):
+                    if cancel.is_set():
+                        return
+                    out.put(("progress", "DSP", i, total))
+                    try:
+                        features = extract_dsp_features(
+                            decode_pcm_slice(path, ffmpeg_path))
+                    except Exception:
+                        features = None  # one odd file must not end the run
+                    if features:
+                        genre = classify_dsp_features(features)
+                        resolved[path] = genre
+                        stats["dsp"] += 1
+                        out.put(("genre", path, genre, "dsp"))
+                out.put(("progress", "DSP", total, total))
+
+        stats["unsorted"] = sum(1 for p in files if p not in resolved)
+    except Exception as exc:
+        stats["note"] = f"stopped early: {exc}"
+    out.put(("done", stats))
+
+
+# --------------------------------------------------------------------------
+# Online lyrics sync (LRCLIB)
+#
+# Only ever runs after the user switches the status-bar toggle to
+# [ Online Sync ]. Like the AUTO-SORT section above, nothing here
+# touches Tkinter, so it is safe on the sync worker thread.
+# --------------------------------------------------------------------------
+
+LRCLIB_API = "https://lrclib.net/api"
+LRCLIB_HEADERS = {"User-Agent": f"WaveStack/{APP_VERSION}"}
+LRCLIB_TIMEOUT_SECONDS = 15
+LRCLIB_ATTEMPTS = 3
+# Synced lyrics timed for a different cut of the song (radio edit,
+# extended mix...) would scroll out of step, so a search result is only
+# accepted if its duration is within this many seconds of the file's.
+LRCLIB_DURATION_TOLERANCE = 5
+# This many songs in a row failing with network errors means LRCLIB (or
+# the connection) is down, and the sync switches itself back offline.
+LRCLIB_MAX_CONSECUTIVE_FAILURES = 3
+
+# Download sites stamp their name into titles and filenames in endless
+# variations ("E85 | HipHopKit.com", "Honest_(mp3.pm)", "[www.site.net]").
+# Rather than list sites, anything shaped like a domain name is junk.
+_JUNK_DOMAIN = (
+    r"(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\."
+    r"(?:com|net|org|pm|io|co|me|ru|cc|to|xyz|info|biz|in|ng|fm|tv|uk|us|"
+    r"za|site|online|club|app|live|link|top|vip|ws|su|fun|music|audio|"
+    r"download|lol|is|ly|gg|pro|store|blog)\b(?:/\S*)?")
+_JUNK_DOMAIN_RE = re.compile(_JUNK_DOMAIN, re.IGNORECASE)
+
+# Words that mark a bracketed group or "|"-separated segment as
+# packaging rather than part of the song's name.
+_JUNK_WORDS = (
+    r"official|video|audio|lyrics?|visuali[sz]er|hq|hd|4k|\d{2,3}\s?kbps|"
+    r"kbps|download|mp3|m4a|explicit|clean|dirty|prod(?:uced)?\.?(?:\s+by)?|"
+    r"no\s+dj|remaster(?:ed)?|full\s+song|new\s+song|out\s+now|"
+    r"free\s+download|high\s+quality")
+_JUNK_GROUP_RE = re.compile(
+    r"\s*[\(\[\{][^\(\)\[\]\{\}]*(?:" + _JUNK_DOMAIN + r"|\b(?:"
+    + _JUNK_WORDS + r")\b)[^\(\)\[\]\{\}]*[\)\]\}]", re.IGNORECASE)
+_JUNK_SEGMENT_RE = re.compile(
+    _JUNK_DOMAIN + r"|^\s*(?:(?:" + _JUNK_WORDS + r"|music|the|by)\s*)+$",
+    re.IGNORECASE)
+_JUNK_TRAILING_RE = re.compile(
+    r"(?:\s+|^)(?:official\s+(?:music\s+)?(?:video|audio)|lyrics?\s+video|"
+    r"official\s+lyrics?|\d{2,3}\s?kbps|free\s+download|mp3\s+download|"
+    r"no\s+dj|hq|hd)\s*$", re.IGNORECASE)
+_LEADING_TRACK_NO_RE = re.compile(r"^\d{1,2}(?:[.)]\s+|\s+-\s+)")
+_FEATURING_RE = re.compile(
+    r"\s*[\(\[]\s*(?:feat(?:uring)?|ft|with)\b[^\)\]]*[\)\]]"
+    r"|\s+(?:feat(?:uring)?|ft)\b\.?\s.*$", re.IGNORECASE)
+
+
+def clean_track_title(text, from_filename=False):
+    """Strip download-site junk from a title tag or filename so it can
+    be looked up: site names in any position or bracket style, "|"
+    suffixes, "Official Video" / "320kbps" / "No DJ" style packaging.
+    With from_filename=True also turns underscores into spaces and drops
+    a leading track number. Never returns less than it was given a
+    reason to: if cleaning would leave nothing, the tidied original is
+    returned instead."""
+    if not text:
+        return ""
+    original = " ".join(str(text).replace("\x00", " ").split())
+    s = original.replace("\u2019", "'").replace("\u2018", "'")
+    if from_filename:
+        s = s.replace("_", " ")
+    previous = None
+    while previous != s:          # nested/adjacent groups: "(x) [y]"
+        previous = s
+        s = _JUNK_GROUP_RE.sub("", s)
+    # "Title | Site.com", "Title || Official Video": keep the real parts
+    segments = [seg for seg in re.split(r"\s*\|+\s*|\s+~\s+|\s+//\s+", s)
+                if seg.strip() and not _JUNK_SEGMENT_RE.search(seg)]
+    if segments:
+        s = segments[0]
+    s = _JUNK_DOMAIN_RE.sub(" ", s)
+    previous = None
+    while previous != s:
+        previous = s
+        s = _JUNK_TRAILING_RE.sub("", s).strip(" -_|.,~")
+    if from_filename:
+        s = _LEADING_TRACK_NO_RE.sub("", s)
+    s = " ".join(s.split()).strip(" -_|.,~")
+    return s or original
+
+
+def strip_featuring(title):
+    """ "Around Me (feat. Don Toliver)" -> "Around Me". """
+    return _FEATURING_RE.sub("", title).strip() or title
+
+
+def _primary_artist(text):
+    """The first-billed artist of "A, B & C" / "A/B" / "A ft. B"."""
+    for part in _ARTIST_SPLIT_RE.split(text or ""):
+        if part.strip():
+            return part.strip()
+    return ""
+
+
+def describe_track_for_lyrics(mp3_path):
+    """Work out what to ask LRCLIB for. Returns a dict with:
+
+      title     cleaned track title ("" if it can't be told apart
+                from the artist -- see query)
+      artist    first-billed artist, "" if unknown
+      duration  length in seconds, or None
+      query     free-text fallback: the cleaned filename, for files
+                with no usable tags
+
+    Tags win over the filename; the filename fills in whatever the
+    tags lack."""
+    title = artist = ""
+    duration = None
+    if MUTAGEN_AVAILABLE:
+        try:
+            tags = EasyID3(mp3_path)
+            title = (tags.get("title") or [""])[0]
+            artist = (tags.get("artist") or [""])[0]
+        except Exception:
+            pass
+        try:
+            duration = float(MP3(mp3_path).info.length)
+        except Exception:
+            duration = None
+
+    stem = os.path.splitext(os.path.basename(mp3_path))[0]
+    cleaned_stem = clean_track_title(stem, from_filename=True)
+    if " " not in cleaned_stem:
+        # "Don-Toliver-E85": hyphens are the only word separators
+        cleaned_stem = " ".join(cleaned_stem.replace("-", " ").split())
+
+    title = clean_track_title(title)
+    artist = _primary_artist(clean_track_title(artist))
+    if " - " in cleaned_stem:
+        file_artist, file_title = cleaned_stem.split(" - ", 1)
+        if not title:
+            title = file_title.strip()
+        if not artist:
+            artist = _primary_artist(file_artist)
+    return {"title": title, "artist": artist, "duration": duration,
+            "query": cleaned_stem}
+
+
+class LrclibUnavailable(Exception):
+    """LRCLIB couldn't be reached, or kept answering with server errors."""
+
+
+def _lrclib_request(endpoint, params, cancel):
+    """GET an LRCLIB endpoint, retrying timeouts, 429s and 5xx answers
+    with a short back-off. Returns parsed JSON, or None for a definite
+    "no such thing" (404 / 400). Raises LrclibUnavailable if every
+    attempt failed."""
+    for attempt in range(LRCLIB_ATTEMPTS):
+        if cancel.is_set():
+            return None
+        try:
+            response = requests.get(f"{LRCLIB_API}/{endpoint}", params=params,
+                                    headers=LRCLIB_HEADERS,
+                                    timeout=LRCLIB_TIMEOUT_SECONDS)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code in (400, 404):
+                return None
+        except (requests.RequestException, ValueError):
+            pass
+        # cancel.wait() doubles as an interruptible sleep
+        if cancel.wait(1.5 * (attempt + 1)):
+            return None
+    raise LrclibUnavailable(endpoint)
+
+
+def _pick_synced_result(results, title, artist, duration, query_text):
+    """Choose the best synced-lyrics record from an LRCLIB search, or
+    None. A record must actually be this song -- same title, and
+    (where known) same artist and a matching duration."""
+    want_title = _normalize_token_text(strip_featuring(title)) if title else ""
+    want_artist = _normalize_token_text(artist) if artist else ""
+    query_tokens = set(_normalize_token_text(query_text).split())
+    best, best_gap = None, None
+    for record in results if isinstance(results, list) else []:
+        if not isinstance(record, dict) or not record.get("syncedLyrics"):
+            continue
+        got_title = _normalize_token_text(
+            strip_featuring(str(record.get("trackName") or "")))
+        got_artist = _normalize_token_text(str(record.get("artistName") or ""))
+        if not got_title:
+            continue
+        if want_title:
+            if got_title != want_title:
+                continue
+            if want_artist and f" {want_artist} " not in f" {got_artist} ":
+                continue
+        else:
+            # Free-text search: every word of the record's title, and
+            # its first-billed artist, must appear in our filename.
+            lead = _normalize_token_text(
+                _primary_artist(str(record.get("artistName") or "")))
+            if not set(got_title.split()) <= query_tokens:
+                continue
+            if not lead or not set(lead.split()) <= query_tokens:
+                continue
+        gap = 0.0
+        if duration and record.get("duration"):
+            try:
+                gap = abs(float(record["duration"]) - duration)
+            except (TypeError, ValueError):
+                gap = 0.0
+            if gap > LRCLIB_DURATION_TOLERANCE:
+                continue
+        if best_gap is None or gap < best_gap:
+            best, best_gap = record, gap
+    return best
+
+
+def fetch_synced_lyrics(info, cancel):
+    """Look one track up on LRCLIB. Returns the LRC text, or None if
+    LRCLIB has no synced lyrics for it. Raises LrclibUnavailable on
+    network trouble.
+
+    Tries the cheap exact-match endpoint first, then the fuzzy search
+    (with and without any "feat." suffix), then a free-text search on
+    the cleaned filename for files with no usable tags."""
+    title, artist = info["title"], info["artist"]
+    duration, query = info["duration"], info["query"]
+
+    if title and artist:
+        variants = [title]
+        if strip_featuring(title) != title:
+            variants.append(strip_featuring(title))
+        for variant in variants:
+            record = _lrclib_request(
+                "get", {"track_name": variant, "artist_name": artist}, cancel)
+            if isinstance(record, dict) and record.get("syncedLyrics"):
+                gap = 0.0
+                try:
+                    if duration and record.get("duration"):
+                        gap = abs(float(record["duration"]) - duration)
+                except (TypeError, ValueError):
+                    pass
+                if gap <= LRCLIB_DURATION_TOLERANCE:
+                    return record["syncedLyrics"]
+        for variant in variants:
+            if cancel.is_set():
+                return None
+            results = _lrclib_request(
+                "search", {"track_name": variant, "artist_name": artist},
+                cancel)
+            record = _pick_synced_result(results, variant, artist, duration,
+                                         query)
+            if record:
+                return record["syncedLyrics"]
+
+    if query and not cancel.is_set():
+        results = _lrclib_request("search", {"q": query}, cancel)
+        record = _pick_synced_result(results, "" if not artist else title,
+                                     artist, duration, query)
+        if record:
+            return record["syncedLyrics"]
+    return None
+
+
+def run_lyrics_sync_worker(directory, fallback_files, out, cancel):
+    """Online-sync background thread body: for every MP3 with no .lrc
+    beside it, try to download synced lyrics from LRCLIB.
+
+    Reports only through *out* (drained by WaveStackApp._tick):
+
+      ("status", text)
+      ("downloaded", mp3_path)
+      ("unreachable",)      LRCLIB can't be reached; go back offline
+
+    One song failing never stops the run; only
+    LRCLIB_MAX_CONSECUTIVE_FAILURES network failures in a row do."""
+    out.put(("status", "Scanning local .lrc files..."))
+    files = scan_mp3_files(directory) if directory else list(fallback_files)
+    if not files:
+        out.put(("status", "No tracks to sync."))
+        return
+    missing = [p for p in files
+               if not os.path.exists(os.path.splitext(p)[0] + ".lrc")]
+    if not missing:
+        out.put(("status", f"All {len(files)} tracks already have lyrics."))
+        return
+
+    downloaded = not_found = failed = consecutive_failures = 0
+    for i, mp3_path in enumerate(missing):
+        if cancel.is_set():
+            return
+        out.put(("status", f"Fetching lyrics {i + 1}/{len(missing)}: "
+                           f"{os.path.basename(mp3_path)}..."))
+        try:
+            lyrics = fetch_synced_lyrics(describe_track_for_lyrics(mp3_path),
+                                         cancel)
+        except LrclibUnavailable:
+            failed += 1
+            consecutive_failures += 1
+            if consecutive_failures >= LRCLIB_MAX_CONSECUTIVE_FAILURES:
+                out.put(("status",
+                         f"Can't reach LRCLIB -- sync paused "
+                         f"({downloaded} downloaded so far)."))
+                out.put(("unreachable",))
+                return
+            continue
+        except Exception:
+            failed += 1   # one odd file must not end the run
+            continue
+        if cancel.is_set():
+            return
+        consecutive_failures = 0
+        if lyrics and _LRC_TIMESTAMP_RE.search(lyrics):
+            lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+            try:
+                with open(lrc_path + ".tmp", "w", encoding="utf-8") as fh:
+                    fh.write(lyrics)
+                os.replace(lrc_path + ".tmp", lrc_path)
+                downloaded += 1
+                out.put(("downloaded", mp3_path))
+            except OSError:
+                failed += 1
+        else:
+            not_found += 1
+        if cancel.wait(0.3):   # be polite to a free public API
+            return
+
+    summary = f"Lyrics sync done: {downloaded} downloaded"
+    if not_found:
+        summary += f", {not_found} not on LRCLIB"
+    if failed:
+        summary += f", {failed} failed (toggle again to retry)"
+    out.put(("status", summary + "."))
 
 
 # --------------------------------------------------------------------------
@@ -969,6 +1810,11 @@ class CrtLyricsDisplay(tk.Frame):
             cursor="arrow",
             state=tk.DISABLED,
             padx=4, pady=4,
+            # A Text asks for 80x24 characters by default, which made
+            # this terminal dictate the whole lower pane's proportions.
+            # Asking for almost nothing lets the parent's grid weights
+            # decide its size instead.
+            width=1, height=1,
         )
         self._scrollbar = tk.Scrollbar(self, orient=tk.VERTICAL,
                                         command=self._text.yview,
@@ -1217,14 +2063,29 @@ class WaveStackApp(tk.Tk):
         self._pending_resume_ticks = 0
         self._last_autosave = 0.0
 
-        # Search-suggestions dropdown state: the list of full file
-        # paths currently shown in the dropdown, in display order, so
-        # a click or Enter can map a row straight back to a path.
-        self._current_suggestions = []
+        # Library tree state. The Library listbox shows a collapsible
+        # genre tree, so a listbox row index is NOT an index into
+        # library_files: visual_row_map is the only valid way to turn a
+        # row into something, as {row: ("folder", genre_key)} or
+        # {row: ("track", path)}. library_files stays the flat list of
+        # playable tracks that Next/Prev/Shuffle/Repeat operate on.
+        self.visual_row_map = {}
+        self.genre_cache = {}          # {mp3 filename: {"genre", "source"}}
+        self.genre_expanded = {}       # {genre_key: bool}; missing = open
+        self.tree_root_expanded = True
+        self._tree_filter = ""         # lowercase search query, "" = none
+        self._genre_cache_dirty = False
+
+        # AUTO-SORT worker state (see run_autosort_worker)
+        self._autosort_thread = None
+        self._autosort_queue = None
+        self._autosort_cancel = None
+        self._autosort_poll_id = None
         # LRC sync state
         self.sync_enabled = False
         self.sync_thread = None
         self.cancel_sync = threading.Event()
+        self._sync_events = queue.Queue()
         self.lrc_status_var = tk.StringVar(value="No internet access (Offline Mode)")
 
         self.status_var = tk.StringVar(value="Ready")
@@ -1481,9 +2342,14 @@ class WaveStackApp(tk.Tk):
         self.visualizer_showing = False
         self.visualizer = Visualizer(self.outer_frame)
         self.visualizer.set_volume(70)
-        self.panes.columnconfigure(0, weight=3)
+        # Library (col 0) and Queue+Lyrics (col 2) share one "uniform"
+        # group, which makes grid give them exactly equal widths; the
+        # button column between them stays at its natural width. The
+        # listboxes and the lyrics Text all request width=1 so that
+        # those weights, not the widgets' default sizes, set the split.
+        self.panes.columnconfigure(0, weight=1, uniform="side_pane")
         self.panes.columnconfigure(1, weight=0)
-        self.panes.columnconfigure(2, weight=2)
+        self.panes.columnconfigure(2, weight=1, uniform="side_pane")
         self.panes.rowconfigure(0, weight=1)
 
         # -- Library pane --
@@ -1511,30 +2377,12 @@ class WaveStackApp(tk.Tk):
         self.search_entry.bind("<Down>", self._on_search_arrow_down)
         self.search_entry.bind("<Up>", self._on_search_arrow_up)
 
-        # Suggestions dropdown: a plain child of the main window,
-        # positioned with .place() rather than shown as a separate
-        # Toplevel popup. A Toplevel's requested screen position is
-        # frequently ignored under Wayland (Ubuntu 26.04's default
-        # session), which would make a floating popup appear in the
-        # wrong place or not track the window at all; a placed child
-        # widget is pure internal Tk layout and has no such risk.
-        self.suggestions_frame = tk.Frame(self, bg=t["border_black"], bd=1,
-                                           relief=tk.RAISED)
-        self.suggestions_listbox = tk.Listbox(
-            self.suggestions_frame, bg=t["entry_bg"], fg=t["entry_fg"],
-            font=self.font_normal, relief=tk.FLAT, bd=0,
-            selectbackground=t["select_bg"], selectforeground=t["select_fg"],
-            activestyle="none", exportselection=False, highlightthickness=0)
-        self.suggestions_listbox.pack(fill=tk.BOTH, expand=True,
-                                       padx=1, pady=1)
-        self.suggestions_listbox.bind("<Button-1>",
-                                       self._on_suggestion_clicked)
-
         self.lib_list_frame = tk.Frame(self.lib_frame, bg=t["bg"])
         self.lib_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.lib_scroll = tk.Scrollbar(self.lib_list_frame, orient=tk.VERTICAL)
         self.library_listbox = tk.Listbox(
             self.lib_list_frame, bg=t["entry_bg"], fg=t["entry_fg"], font=self.font_normal,
+            width=1, height=1,
             relief=tk.SUNKEN, bd=2, selectbackground=t["select_bg"],
             selectforeground=t["select_fg"], activestyle="none",
             selectmode=tk.EXTENDED, exportselection=False,
@@ -1542,8 +2390,11 @@ class WaveStackApp(tk.Tk):
         self.lib_scroll.config(command=self.library_listbox.yview)
         self.library_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.lib_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.library_listbox.bind("<Button-1>", self._on_library_click)
         self.library_listbox.bind("<Double-Button-1>",
-                                   lambda e: self.on_play_clicked())
+                                   self._on_library_double_click)
+        self.library_listbox.bind("<Return>", self._on_library_return)
+        self.library_listbox.bind("<KP_Enter>", self._on_library_return)
         self.library_listbox.bind("<Button-3>",
                                    self.show_library_context_menu)
 
@@ -1552,38 +2403,45 @@ class WaveStackApp(tk.Tk):
         self.mid_frame.grid(row=0, column=1, sticky="ns", padx=4)
         self.mid_inner = tk.Frame(self.mid_frame, bg=t["bg"])
         self.mid_inner.pack(expand=True)
+        self.autosort_btn = tk.Button(self.mid_inner, text="AUTO-SORT",
+                  command=self.on_autosort_clicked, font=self.font_normal,
+                  bg=t["btn_bg"], fg=t["btn_fg"], relief=tk.RAISED, bd=3,
+                  activebackground=t["btn_active_bg"],
+                  activeforeground=t["btn_active_fg"])
+        self.autosort_btn.pack(pady=3, fill=tk.X)
         self.enqueue_btn = tk.Button(self.mid_inner, text="Enqueue >>",
                   command=self.on_enqueue_clicked, font=self.font_normal,
                   bg=t["btn_bg"], fg=t["btn_fg"], relief=tk.RAISED, bd=3,
                   activebackground=t["btn_active_bg"],
                   activeforeground=t["btn_active_fg"])
-        self.enqueue_btn.pack(pady=6, fill=tk.X)
+        self.enqueue_btn.pack(pady=3, fill=tk.X)
         self.remove_btn = tk.Button(self.mid_inner, text="<< Remove",
                   command=self.on_remove_from_queue_clicked,
                   font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
                   relief=tk.RAISED, bd=3,
                   activebackground=t["btn_active_bg"],
                   activeforeground=t["btn_active_fg"])
-        self.remove_btn.pack(pady=6, fill=tk.X)
+        self.remove_btn.pack(pady=3, fill=tk.X)
         self.clear_btn = tk.Button(self.mid_inner, text="Clear Queue",
                   command=self.on_clear_queue_clicked,
                   font=self.font_normal, bg=t["btn_bg"], fg=t["btn_fg"],
                   relief=tk.RAISED, bd=3,
                   activebackground=t["btn_active_bg"],
                   activeforeground=t["btn_active_fg"])
-        self.clear_btn.pack(pady=6, fill=tk.X)
+        self.clear_btn.pack(pady=3, fill=tk.X)
 
         self.vinyl = VinylDisc(self.mid_inner, theme=t)
-        self.vinyl.pack(pady=(14, 6))
+        self.vinyl.pack(pady=(8, 2))
 
 
         # -- Right column: Queue (top) + CRT Lyrics Terminal (bottom) --
-        # A dedicated container occupies column 2 so both sub-panes can
-        # share vertical space with an equal 50/50 split.
+        # A dedicated container occupies column 2. The Queue keeps its
+        # natural height (QUEUE_VISIBLE_ROWS rows) and the lyrics
+        # terminal takes all the remaining height below it.
         self.right_col = tk.Frame(self.panes, bg=t["bg"])
         self.right_col.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
-        self.right_col.rowconfigure(0, weight=1)
-        self.right_col.rowconfigure(1, weight=1)
+        self.right_col.rowconfigure(0, weight=0)
+        self.right_col.rowconfigure(1, weight=1, minsize=LYRICS_MIN_HEIGHT)
         self.right_col.columnconfigure(0, weight=1)
 
         # Queue sub-pane (top half)
@@ -1604,6 +2462,7 @@ class WaveStackApp(tk.Tk):
         self.queue_scroll = tk.Scrollbar(self.queue_list_frame, orient=tk.VERTICAL)
         self.queue_listbox = tk.Listbox(
             self.queue_list_frame, bg=t["entry_bg"], fg=t["entry_fg"], font=self.font_normal,
+            width=1, height=QUEUE_VISIBLE_ROWS,
             relief=tk.SUNKEN, bd=2, selectbackground=t["select_bg"],
             selectforeground=t["select_fg"], activestyle="none",
             selectmode=tk.EXTENDED, exportselection=False,
@@ -1756,14 +2615,6 @@ class WaveStackApp(tk.Tk):
                 fg=t["search_placeholder_fg"] if is_placeholder else t["search_normal_fg"],
                 insertbackground=t["entry_insert"]
             )
-        if hasattr(self, "suggestions_frame"):
-            self.suggestions_frame.configure(bg=t["border_black"])
-        if hasattr(self, "suggestions_listbox"):
-            self.suggestions_listbox.configure(
-                bg=t["entry_bg"], fg=t["entry_fg"],
-                selectbackground=t["select_bg"],
-                selectforeground=t["select_fg"]
-            )
         if hasattr(self, "lib_list_frame"):
             self.lib_list_frame.configure(bg=t["bg"])
         if hasattr(self, "lib_scroll"):
@@ -1784,7 +2635,8 @@ class WaveStackApp(tk.Tk):
             self.mid_frame.configure(bg=t["bg"])
         if hasattr(self, "mid_inner"):
             self.mid_inner.configure(bg=t["bg"])
-        for btn in (getattr(self, "enqueue_btn", None),
+        for btn in (getattr(self, "autosort_btn", None),
+                    getattr(self, "enqueue_btn", None),
                     getattr(self, "remove_btn", None),
                     getattr(self, "clear_btn", None)):
             if btn:
@@ -1849,22 +2701,192 @@ class WaveStackApp(tk.Tk):
                     f"This folder has no .mp3 files, or doesn't exist:\n\n"
                     f"{directory}")
             return False
+        # A sort still running against the previous folder is stopped
+        # (and its results saved there) before switching.
+        self._cancel_autosort()
+        self._save_genre_cache_if_dirty()
         self.library_dir = directory
         self.library_files = files
         self._shuffle_pool = []
+        self.genre_cache = load_genre_cache(directory)
+        self.genre_expanded = {}
+        self.tree_root_expanded = True
         self.refresh_library_listbox()
         self.status_var.set(f"Loaded {len(files)} track(s) from {directory}")
         return True
 
-    def refresh_library_listbox(self):
-        self.library_listbox.delete(0, tk.END)
+    # -- library tree ---------------------------------------------------
+
+    def _genre_of(self, path):
+        record = self.genre_cache.get(os.path.basename(path))
+        return record["genre"] if record else GENRE_UNSORTED
+
+    def _group_tracks_by_genre(self):
+        """Return [(genre_key, [paths])] in display order -- core genres
+        first, then any other tagged genres alphabetically, with the
+        Unsorted folder last -- honouring the current search filter.
+        Empty folders are left out."""
+        query = self._tree_filter
+        groups = {}
         for path in self.library_files:
-            name = os.path.splitext(os.path.basename(path))[0]
-            self.library_listbox.insert(tk.END, name)
+            if query:
+                name = os.path.splitext(os.path.basename(path))[0].lower()
+                if query not in name:
+                    continue
+            groups.setdefault(self._genre_of(path), []).append(path)
+        ordered = [g for g in GENRE_ORDER if g in groups]
+        ordered += sorted((g for g in groups
+                           if g not in GENRE_ORDER and g != GENRE_UNSORTED),
+                          key=str.lower)
+        if GENRE_UNSORTED in groups:
+            ordered.append(GENRE_UNSORTED)
+        return [(g, groups[g]) for g in ordered]
+
+    def refresh_library_listbox(self):
+        """Rebuild the Library tree and visual_row_map from scratch.
+
+        Safe to call at any time (it's what AUTO-SORT does as results
+        trickle in): the current selection and scroll position are
+        carried across the rebuild by identity, not by row number."""
+        lb = self.library_listbox
+        selected = {self.visual_row_map.get(i) for i in lb.curselection()}
+        top_entry = (self.visual_row_map.get(lb.nearest(0))
+                     if lb.size() else None)
+
+        filtering = bool(self._tree_filter)
+        groups = self._group_tracks_by_genre()
+        root_open = self.tree_root_expanded or filtering
+        labels = [f"[{'-' if root_open else '+'}] {TREE_ROOT_LABEL}"]
+        entries = [("folder", TREE_ROOT_KEY)]
+        if root_open:
+            for g_idx, (genre, paths) in enumerate(groups):
+                last_genre = g_idx == len(groups) - 1
+                # While a search filter is active every matching folder
+                # is shown open, without disturbing the remembered
+                # open/closed state that comes back when it's cleared.
+                is_open = filtering or self.genre_expanded.get(genre, True)
+                labels.append(
+                    f" {'└──' if last_genre else '├──'} "
+                    f"[{'-' if is_open else '+'}] {genre} ({len(paths)})")
+                entries.append(("folder", genre))
+                if not is_open:
+                    continue
+                stem = "     " if last_genre else " │   "
+                for t_idx, path in enumerate(paths):
+                    branch = "└──" if t_idx == len(paths) - 1 else "├──"
+                    name = os.path.splitext(os.path.basename(path))[0]
+                    labels.append(f"{stem}{branch} {name}")
+                    entries.append(("track", path))
+            if filtering and not groups:
+                labels.append(" └── (no matches)")
+                entries.append(("note", None))
+
+        lb.delete(0, tk.END)
+        if labels:
+            lb.insert(tk.END, *labels)
+        self.visual_row_map = dict(enumerate(entries))
+
+        selected.discard(None)
+        for row, entry in self.visual_row_map.items():
+            if entry in selected:
+                lb.selection_set(row)
+        top_row = self._row_for_entry(top_entry) if top_entry else None
+        if top_row is not None:
+            lb.yview(top_row)
         self._highlight_now_playing()
-        self._hide_suggestions()  # library changed; any open suggestions are stale
+
+    def _row_for_entry(self, entry):
+        for row, candidate in self.visual_row_map.items():
+            if candidate == entry:
+                return row
+        return None
+
+    def _track_rows(self):
+        return [row for row, (kind, _key) in sorted(self.visual_row_map.items())
+                if kind == "track"]
+
+    def _selected_track_paths(self):
+        """The playable tracks in the current Library selection, in
+        display order. Folder header rows are skipped."""
+        paths = []
+        for row in self.library_listbox.curselection():
+            kind, key = self.visual_row_map.get(row, (None, None))
+            if kind == "track":
+                paths.append(key)
+        return paths
+
+    def _select_library_row(self, row):
+        self.library_listbox.selection_clear(0, tk.END)
+        self.library_listbox.selection_set(row)
+        self.library_listbox.activate(row)
+        self.library_listbox.see(row)
+
+    def _toggle_tree_folder(self, key):
+        if self._tree_filter:
+            return  # filtered view is always fully expanded
+        if key == TREE_ROOT_KEY:
+            self.tree_root_expanded = not self.tree_root_expanded
+        else:
+            self.genre_expanded[key] = not self.genre_expanded.get(key, True)
+        self.refresh_library_listbox()
+        row = self._row_for_entry(("folder", key))
+        if row is not None:
+            self._select_library_row(row)
+
+    def _library_row_at(self, event):
+        """The row actually under the pointer, or None for a click in
+        the empty space below the last row (where Listbox.nearest()
+        would otherwise report the last row)."""
+        lb = self.library_listbox
+        if not lb.size():
+            return None
+        row = lb.nearest(event.y)
+        bbox = lb.bbox(row)
+        if not bbox or event.y > bbox[1] + bbox[3]:
+            return None
+        return row
+
+    def _on_library_click(self, event):
+        # A plain click on a folder header toggles it. Everything else
+        # (track rows, Ctrl/Shift extend-clicks) falls through to the
+        # Listbox's own selection behaviour.
+        if event.state & 0x0005:   # Shift or Control held
+            return
+        kind, key = self.visual_row_map.get(self._library_row_at(event),
+                                            (None, None))
+        if kind != "folder":
+            return
+        self.library_listbox.focus_set()
+        self._toggle_tree_folder(key)
+        return "break"
+
+    def _on_library_double_click(self, event):
+        # Tk delivers the second press of a double-click here INSTEAD of
+        # to <Button-1>, so a double-clicked folder has been toggled
+        # exactly once (by its first press) and needs nothing more.
+        kind, key = self.visual_row_map.get(self._library_row_at(event),
+                                            (None, None))
+        if kind == "track":
+            self._play_path(key)
+        return "break"
+
+    def _on_library_return(self, event=None):
+        lb = self.library_listbox
+        if not lb.size():
+            return "break"
+        kind, key = self.visual_row_map.get(lb.index(tk.ACTIVE), (None, None))
+        if kind == "folder":
+            self._toggle_tree_folder(key)
+        elif kind == "track":
+            self._play_path(key)
+        return "break"
 
     # -- search ---------------------------------------------------
+    #
+    # Typing in the search entry filters the Library tree in place:
+    # only matching tracks are shown, with their genre folders forced
+    # open. Up/Down move through the matches, Enter picks one, and
+    # clearing the entry (or Escape) restores the normal tree.
 
     def _on_focus_search_shortcut(self, event=None):
         self.search_entry.focus_set()
@@ -1881,6 +2903,7 @@ class WaveStackApp(tk.Tk):
         self.search_entry.delete(0, tk.END)
         self.search_entry.insert(0, SEARCH_PLACEHOLDER_TEXT)
         self.search_entry.config(fg=t["search_placeholder_fg"])
+        self._set_tree_filter("")
 
     def _on_search_keypress(self, event):
         # Fires before the character is actually inserted. If the
@@ -1897,136 +2920,206 @@ class WaveStackApp(tk.Tk):
     def _on_search_key_release(self, event):
         if event.keysym in _SEARCH_NON_TEXT_KEYSYMS:
             return  # these don't change the query; avoid pointless rebuilds
-        self._update_suggestions()
+        query = "" if self._search_showing_placeholder() \
+            else self.search_entry.get()
+        self._set_tree_filter(query)
+
+    def _set_tree_filter(self, query):
+        query = (query or "").strip().lower()
+        if query == self._tree_filter:
+            return
+        self._tree_filter = query
+        self.refresh_library_listbox()
+        if query:
+            # Pre-select the first match so Enter works straight away.
+            rows = self._track_rows()
+            self.library_listbox.yview(0)
+            if rows:
+                self.library_listbox.selection_clear(0, tk.END)
+                self.library_listbox.selection_set(rows[0])
+                self.library_listbox.activate(rows[0])
 
     def _on_search_focus_out(self, event=None):
-        # Delay briefly so a click landing on the suggestions list has
-        # a chance to register (and move focus there) before deciding
-        # whether to close the dropdown -- otherwise closing it here
-        # first could swallow that click.
-        self.after(120, self._resolve_search_focus_out)
-
-    def _resolve_search_focus_out(self):
-        if self.focus_get() is self.suggestions_listbox:
-            return
+        # An emptied entry gets its placeholder back. A non-empty one
+        # is left alone, so the tree stays filtered while the user
+        # clicks around in the results.
         if not self.search_entry.get():
             t = getattr(self, "theme", THEMES[DEFAULT_THEME])
             self.search_entry.config(fg=t["search_placeholder_fg"])
             self.search_entry.insert(0, SEARCH_PLACEHOLDER_TEXT)
-        self._hide_suggestions()
 
     def _on_search_enter(self, event=None):
-        if not self._current_suggestions:
+        if not self._tree_filter:
             return "break"
-        sel = self.suggestions_listbox.curselection()
-        idx = sel[0] if sel else 0
-        self._confirm_suggestion(idx)
+        paths = self._selected_track_paths()
+        if not paths:
+            rows = self._track_rows()
+            if not rows:
+                return "break"
+            paths = [self.visual_row_map[rows[0]][1]]
+        self._clear_search_to_placeholder()
+        self._select_track_in_library(paths[0])
+        self.library_listbox.focus_set()
         return "break"
 
     def _on_search_escape(self, event=None):
-        self._hide_suggestions()
         self._clear_search_to_placeholder()
         self.library_listbox.focus_set()
         return "break"
 
     def _on_search_arrow_down(self, event=None):
-        self._move_suggestion_selection(1)
+        self._move_search_selection(1)
         return "break"
 
     def _on_search_arrow_up(self, event=None):
-        self._move_suggestion_selection(-1)
+        self._move_search_selection(-1)
         return "break"
 
-    def _move_suggestion_selection(self, delta):
-        count = len(self._current_suggestions)
-        if count == 0:
+    def _move_search_selection(self, delta):
+        """Move the Library selection between track rows (skipping
+        folder headers) while focus stays in the search entry."""
+        rows = self._track_rows()
+        if not rows:
             return
-        sel = self.suggestions_listbox.curselection()
-        current = sel[0] if sel else 0
-        new_idx = max(0, min(count - 1, current + delta))
-        self.suggestions_listbox.selection_clear(0, tk.END)
-        self.suggestions_listbox.selection_set(new_idx)
-        self.suggestions_listbox.activate(new_idx)
-        self.suggestions_listbox.see(new_idx)
-
-    def _on_suggestion_clicked(self, event):
-        # Compute the clicked row directly from the click position
-        # rather than trusting curselection(): this instance-level
-        # binding runs before the Listbox's own class-level "select
-        # the clicked row" binding, so curselection() could still
-        # reflect the previous selection at this point.
-        idx = self.suggestions_listbox.nearest(event.y)
-        self._confirm_suggestion(idx)
-        return "break"
-
-    def _confirm_suggestion(self, idx):
-        if not (0 <= idx < len(self._current_suggestions)):
-            return
-        path = self._current_suggestions[idx]
-        self._select_track_in_library(path)
-        self._hide_suggestions()
-        self._clear_search_to_placeholder()
-        self.library_listbox.focus_set()
+        selected = [r for r in self.library_listbox.curselection()
+                    if r in rows]
+        if selected:
+            pos = rows.index(selected[0]) + delta
+            pos = max(0, min(len(rows) - 1, pos))
+        else:
+            pos = 0
+        self._select_library_row(rows[pos])
 
     def _select_track_in_library(self, path):
+        """Select *path*'s row, opening its folder first if needed."""
         if path not in self.library_files:
             return
-        idx = self.library_files.index(path)
-        self.library_listbox.selection_clear(0, tk.END)
-        self.library_listbox.selection_set(idx)
-        self.library_listbox.activate(idx)
-        self.library_listbox.see(idx)
+        if self._row_for_entry(("track", path)) is None:
+            self.tree_root_expanded = True
+            self.genre_expanded[self._genre_of(path)] = True
+            self.refresh_library_listbox()
+        row = self._row_for_entry(("track", path))
+        if row is not None:
+            self._select_library_row(row)
 
-    def _get_search_matches(self, query, limit=8):
-        query = query.strip().lower()
-        if not query:
-            return []
-        starts_with, contains = [], []
-        for path in self.library_files:
-            name = os.path.splitext(os.path.basename(path))[0].lower()
-            if name.startswith(query):
-                starts_with.append(path)
-            elif query in name:
-                contains.append(path)
-        return (starts_with + contains)[:limit]
+    # -- AUTO-SORT ---------------------------------------------------
 
-    def _update_suggestions(self):
-        query = "" if self._search_showing_placeholder() \
-            else self.search_entry.get()
-        if not query.strip():
-            self._hide_suggestions()
+    def _autosort_running(self):
+        return (self._autosort_thread is not None
+                and self._autosort_thread.is_alive())
+
+    def _set_autosort_status(self, text):
+        self.status_var.set(text)
+        self.lrc_status_var.set(text)
+
+    def on_autosort_clicked(self):
+        """Start classifying every track that has no genre yet, on a
+        background thread -- or stop the run if one is in progress."""
+        if self._autosort_queue is not None:
+            self._cancel_autosort()
+            self._set_autosort_status("Auto-Sort stopped.")
             return
-        self._show_suggestions(self._get_search_matches(query))
+        if not self.library_files:
+            self._set_autosort_status(
+                "No tracks loaded. Use File > Open Folder.")
+            return
+        known = {}
+        for path in self.library_files:
+            record = self.genre_cache.get(os.path.basename(path))
+            if record:
+                known[path] = record["genre"]
+        if len(known) == len(self.library_files):
+            self._set_autosort_status(
+                f"Auto-Sort: all {len(known)} tracks already sorted.")
+            return
 
-    def _show_suggestions(self, matches):
-        self._current_suggestions = matches
-        self.suggestions_listbox.delete(0, tk.END)
-        if matches:
-            for path in matches:
-                name = os.path.splitext(os.path.basename(path))[0]
-                self.suggestions_listbox.insert(tk.END, name)
-            self.suggestions_listbox.config(height=min(len(matches), 8))
-            self.suggestions_listbox.selection_clear(0, tk.END)
-            self.suggestions_listbox.selection_set(0)
-            self.suggestions_listbox.activate(0)
-        else:
-            self.suggestions_listbox.insert(tk.END, "(no matches)")
-            self.suggestions_listbox.config(height=1)
+        self._autosort_cancel = threading.Event()
+        self._autosort_queue = queue.Queue()
+        self._autosort_thread = threading.Thread(
+            target=run_autosort_worker,
+            args=(list(self.library_files), known, self._autosort_queue,
+                  self._autosort_cancel),
+            daemon=True)
+        self._autosort_thread.start()
+        self.autosort_btn.config(text="STOP SORT", relief=tk.SUNKEN)
+        self._set_autosort_status("Auto-Sorting Library...")
+        self._autosort_poll_id = self.after(AUTOSORT_POLL_MS,
+                                            self._poll_autosort)
 
-        self._position_suggestions_box()
-        self.suggestions_frame.lift()
+    def _drain_autosort_queue(self):
+        """Apply everything the worker has reported so far. Returns the
+        worker's final stats dict once it has finished, else None.
+        Main thread only."""
+        finished = None
+        changed = False
+        while True:
+            try:
+                message = self._autosort_queue.get_nowait()
+            except queue.Empty:
+                break
+            kind = message[0]
+            if kind == "genre":
+                _kind, path, genre, source = message
+                self.genre_cache[os.path.basename(path)] = {
+                    "genre": genre, "source": source}
+                changed = True
+            elif kind == "progress":
+                _kind, stage, done, total = message
+                self._set_autosort_status(
+                    f"Auto-Sorting Library [{stage}]: "
+                    f"{done}/{total} tracks...")
+            elif kind == "done":
+                finished = message[1]
+        if changed:
+            self._genre_cache_dirty = True
+            self.refresh_library_listbox()
+        return finished
 
-    def _hide_suggestions(self):
-        self.suggestions_frame.place_forget()
-        self._current_suggestions = []
+    def _poll_autosort(self):
+        self._autosort_poll_id = None
+        if self._autosort_queue is None:
+            return
+        stats = self._drain_autosort_queue()
+        if stats is None:
+            self._autosort_poll_id = self.after(AUTOSORT_POLL_MS,
+                                                self._poll_autosort)
+            return
+        self._reset_autosort_state()
+        self._save_genre_cache_if_dirty()
+        sorted_now = stats["id3"] + stats["tokens"] + stats["dsp"]
+        summary = (f"Auto-Sort complete: {sorted_now} sorted "
+                   f"(ID3 {stats['id3']}, tokens {stats['tokens']}, "
+                   f"DSP {stats['dsp']}), {stats['unsorted']} unsorted.")
+        if stats.get("note"):
+            summary += f" [{stats['note']}]"
+        self._set_autosort_status(summary)
 
-    def _position_suggestions_box(self):
-        self.update_idletasks()
-        x = self.search_entry.winfo_rootx() - self.winfo_rootx()
-        y = (self.search_entry.winfo_rooty() - self.winfo_rooty()
-             + self.search_entry.winfo_height())
-        width = self.search_entry.winfo_width()
-        self.suggestions_frame.place(x=x, y=y, width=width)
+    def _cancel_autosort(self):
+        """Stop a running sort, keeping whatever it had classified."""
+        if self._autosort_queue is None:
+            return
+        self._autosort_cancel.set()
+        self._drain_autosort_queue()
+        self._reset_autosort_state()
+        self._save_genre_cache_if_dirty()
+
+    def _reset_autosort_state(self):
+        if self._autosort_poll_id is not None:
+            try:
+                self.after_cancel(self._autosort_poll_id)
+            except Exception:
+                pass
+            self._autosort_poll_id = None
+        self._autosort_queue = None
+        self._autosort_thread = None
+        self._autosort_cancel = None
+        if hasattr(self, "autosort_btn"):
+            self.autosort_btn.config(text="AUTO-SORT", relief=tk.RAISED)
+
+    def _save_genre_cache_if_dirty(self):
+        if self._genre_cache_dirty and self.library_dir:
+            if save_genre_cache(self.library_dir, self.genre_cache):
+                self._genre_cache_dirty = False
 
     def show_startup_missing_dialog(self):
         message = (
@@ -2103,9 +3196,9 @@ class WaveStackApp(tk.Tk):
                 f"Playing: {os.path.basename(self.now_playing)}")
             self._sync_vinyl_spin_state()
             return
-        sel = self.library_listbox.curselection()
-        if sel:
-            self._play_path(self.library_files[sel[0]])
+        selected = self._selected_track_paths()
+        if selected:
+            self._play_path(selected[0])
         elif self.now_playing:
             self._play_path(self.now_playing)
         elif self.library_files:
@@ -2273,24 +3366,28 @@ class WaveStackApp(tk.Tk):
 
     def _highlight_now_playing(self):
         t = getattr(self, "theme", THEMES[DEFAULT_THEME])
-        for i in range(self.library_listbox.size()):
-            self.library_listbox.itemconfig(i, bg=t["entry_bg"], fg=t["entry_fg"])
-        if self.now_playing in self.library_files:
-            idx = self.library_files.index(self.now_playing)
-            self.library_listbox.itemconfig(idx, bg=t["select_bg"],
-                                             fg=t["select_fg"])
+        for row, (kind, key) in self.visual_row_map.items():
+            if kind == "track" and key == self.now_playing:
+                self.library_listbox.itemconfig(row, bg=t["select_bg"],
+                                                 fg=t["select_fg"])
+            elif kind == "track":
+                self.library_listbox.itemconfig(row, bg=t["entry_bg"],
+                                                 fg=t["entry_fg"])
+            else:
+                # folder headers get the title colour, like a caption
+                self.library_listbox.itemconfig(row, bg=t["entry_bg"],
+                                                 fg=t["title_fg"])
 
     # -- queue management ---------------------------------------------------
 
     def on_enqueue_clicked(self):
-        sel = self.library_listbox.curselection()
-        if not sel:
+        paths = self._selected_track_paths()
+        if not paths:
             self.status_var.set("Select a track in Library first.")
             return
-        for i in sel:
-            self.play_queue.append(self.library_files[i])
+        self.play_queue.extend(paths)
         self.refresh_queue_listbox()
-        self.status_var.set(f"Added {len(sel)} track(s) to the queue.")
+        self.status_var.set(f"Added {len(paths)} track(s) to the queue.")
 
     def on_remove_from_queue_clicked(self):
         sel = list(self.queue_listbox.curselection())
@@ -2329,9 +3426,10 @@ class WaveStackApp(tk.Tk):
     def show_library_context_menu(self, event):
         if not self.library_files:
             return
-        idx = self.library_listbox.nearest(event.y)
-        if idx < 0:
-            return
+        idx = self._library_row_at(event)
+        kind, path = self.visual_row_map.get(idx, (None, None))
+        if kind != "track":
+            return  # folder headers have no track actions
         self.library_listbox.selection_clear(0, tk.END)
         self.library_listbox.selection_set(idx)
         t = getattr(self, "theme", THEMES[DEFAULT_THEME])
@@ -2339,7 +3437,8 @@ class WaveStackApp(tk.Tk):
                        activebackground=t["menu_active_bg"],
                        activeforeground=t["menu_active_fg"],
                        font=self.font_normal)
-        menu.add_command(label="Play", command=self.on_play_clicked)
+        menu.add_command(label="Play",
+                          command=lambda: self._play_path(path))
         menu.add_command(label="Add to Queue",
                           command=self.on_enqueue_clicked)
         try:
@@ -2402,6 +3501,7 @@ class WaveStackApp(tk.Tk):
                 self._handle_track_ended()
             elif event_name == "error":
                 self._handle_playback_error()
+        self._drain_sync_events()
 
         if self.now_playing and not self._user_seeking:
             length = self.audio.get_length_seconds()
@@ -2499,89 +3599,45 @@ class WaveStackApp(tk.Tk):
         self.sync_enabled = not self.sync_enabled
         if self.sync_enabled:
             self.sync_btn.config(relief=tk.SUNKEN, text="[ Online Sync ]")
-            self.cancel_sync.clear()
-            if self.sync_thread is None or not self.sync_thread.is_alive():
-                self.sync_thread = threading.Thread(target=self._lrc_sync_worker, daemon=True)
-                self.sync_thread.start()
+            # Each run gets its own cancel flag and queue, so a worker
+            # still winding down from a previous run can't be revived
+            # by, or leak stale messages into, this one.
+            self.cancel_sync = threading.Event()
+            self._sync_events = queue.Queue()
+            self.sync_thread = threading.Thread(
+                target=run_lyrics_sync_worker,
+                args=(self.library_dir, list(self.library_files),
+                      self._sync_events, self.cancel_sync),
+                daemon=True)
+            self.sync_thread.start()
         else:
             self.sync_btn.config(relief=tk.RAISED, text="[ Offline ]")
             self.cancel_sync.set()
             self.lrc_status_var.set("No internet access (Offline Mode)")
 
-    def _lrc_sync_worker(self):
-        self.after(0, self.lrc_status_var.set, "Scanning local .lrc files...")
-        
-        # Determine files to scan
-        if self.library_dir:
-            files_to_scan = scan_mp3_files(self.library_dir)
-        else:
-            files_to_scan = self.library_files
-            
-        if not files_to_scan:
-            self.after(0, self.lrc_status_var.set, "No tracks to sync.")
-            return
-
-        missing_lrc = []
-        for mp3_path in files_to_scan:
-            if self.cancel_sync.is_set():
-                return
-            lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
-            if not os.path.exists(lrc_path):
-                missing_lrc.append(mp3_path)
-
-        if not missing_lrc:
-            if not self.cancel_sync.is_set():
-                self.after(0, self.lrc_status_var.set, "All available lyrics up to date.")
-            return
-
-        for mp3_path in missing_lrc:
-            if self.cancel_sync.is_set():
-                return
-            
-            title, artist = "", ""
-            if MUTAGEN_AVAILABLE:
-                try:
-                    from mutagen.easyid3 import EasyID3
-                    audio = EasyID3(mp3_path)
-                    title = audio.get("title", [""])[0]
-                    artist = audio.get("artist", [""])[0]
-                except Exception:
-                    pass
-                    
-            if not title:
-                title = os.path.splitext(os.path.basename(mp3_path))[0]
-                
-            display_name = os.path.basename(mp3_path)
-            self.after(0, self.lrc_status_var.set, f"Fetching lyrics: {display_name}...")
-            
+    def _drain_sync_events(self):
+        """Apply what the lyrics-sync worker has reported. Called from
+        _tick, so all the Tk work happens on the main thread."""
+        while True:
             try:
-                url = f"https://lrclib.net/api/get?track_name={urllib.parse.quote(title)}"
-                if artist:
-                    url += f"&artist_name={urllib.parse.quote(artist)}"
-                    
-                res = requests.get(url, headers={'User-Agent': 'WaveStack/1.0'}, timeout=5)
-                
-                if res.status_code == 200:
-                    data = res.json()
-                    synced = data.get("syncedLyrics")
-                    if synced:
-                        lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
-                        try:
-                            with open(lrc_path, "w", encoding="utf-8") as f:
-                                f.write(synced)
-                        except OSError:
-                            pass
-                
-                time.sleep(0.5)
-            except requests.RequestException:
-                if not self.cancel_sync.is_set():
-                    self.after(0, self.lrc_status_var.set, "Rate limit: sync paused")
-                    # Turn off sync automatically if connection fails hard
-                    self.after(0, self.toggle_sync)
-                return
-
-        if not self.cancel_sync.is_set():
-            self.after(0, self.lrc_status_var.set, "All lyrics up to date.")
+                message = self._sync_events.get_nowait()
+            except queue.Empty:
+                break
+            if not self.sync_enabled:
+                continue  # switched offline; drop the leftovers
+            kind = message[0]
+            if kind == "status":
+                self.lrc_status_var.set(message[1])
+            elif kind == "downloaded":
+                # Lyrics just arrived for the song that's on right now:
+                # show them without making the user restart the track.
+                if (message[1] == self.now_playing and not self.is_stopped
+                        and hasattr(self, "lyrics_display")):
+                    self.lyrics_display.load_track(message[1])
+            elif kind == "unreachable":
+                status = self.lrc_status_var.get()
+                self.toggle_sync()               # back to [ Offline ]
+                self.lrc_status_var.set(status)  # keep the reason visible
 
     # -- state persistence ---------------------------------------------------
 
@@ -2660,6 +3716,9 @@ class WaveStackApp(tk.Tk):
             self.vinyl.shutdown()
         if hasattr(self, "visualizer"):
             self.visualizer.shutdown()
+        self._cancel_autosort()
+        self._save_genre_cache_if_dirty()
+        self.cancel_sync.set()
         self.save_state()
         self.audio.release()
         self.destroy()
