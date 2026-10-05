@@ -6,13 +6,12 @@ No telemetry, no analytics, and no mandatory cloud connections. Just your local 
 
 ## Screenshot
 
-![WaveStack screenshot](screenshot.png)
-
 ## Features
 
 * **Strict retro aesthetic** thick raised/sunken borders, classic gray (`#C0C0C0`) chrome, monospace fonts, and a scrolling green LCD "now playing" marquee, all built from classic Tkinter widgets (not a themed skin, so it doesn't inherit your desktop's modern GTK/Qt look).
 * **Full playback controls** Play, Pause, Stop, Next, Previous, and Mode Cycling (Normal, Shuffle, Repeat 1, Repeat All).
 * **Library + Queue** browse your music folder, multi-select tracks to enqueue, remove from the queue, right-click context menus.
+* **Collapsible Hierarchical Genre Tree + AUTO-SORT** the Library is an authentic retro directory explorer built purely inside a classic `tk.Listbox` (avoiding themed `ttk` widgets). **AUTO-SORT** classifies tracks fully offline in the background: ID3 `TCON` genre tags first, then artist/filename matching against already-known tracks, then a spectral-analysis heuristic evaluating sub-bass energy, spectral brightness, and onset rhythms (needs `ffmpeg` and `numpy`). Results are cached in `.wavestack_genres.json` inside your music folder.
 * **Synchronized CRT Lyrics Terminal** Displays timestamped `.lrc` lyrics in a monochrome CRT terminal format with active line tracking and click-to-seek support.
 * **Opt-In Online Sync** A dedicated toggle switch defaults to `[ Offline ]`. When switched to `[ Online Sync ]`, it queries the LRCLIB API to download missing `.lrc` files for your local tracks.
 * **Spinning Vinyl Animation & Visualizer** Extracts ID3 album art directly from your local audio files for a rotating vinyl disc, plus an in-app retro equalizer visualizer.
@@ -33,6 +32,7 @@ For the first launch, you need:
 * An internet connection
 * `sudo` access to install VLC, Python, Tkinter, and Python virtual-environment support
 * The complete WaveStack project folder containing `wavestack.py`, `requirements.txt`, and `run.sh`
+* Optional: `ffmpeg` installed on your system PATH for offline acoustic DSP audio classification
 
 ## Quick Start
 
@@ -41,6 +41,7 @@ Open a terminal inside the WaveStack project folder, make the launcher executabl
 ```bash
 chmod +x run.sh
 ./run.sh
+
 ```
 
 On its first run, WaveStack automatically:
@@ -73,9 +74,12 @@ After setup, start WaveStack by clicking its desktop icon or searching for **Wav
 * Click `[ Offline ]` to switch to `[ Online Sync ]`. The player will read missing lyric tags in your loaded music directory, securely query LRCLIB in the background, and save `.lrc` files locally.
 * **Click-to-Seek**: Click any lyric line on the CRT terminal to jump directly to that timestamp in the audio track.
 
-### Library & Queue
+### Library Tree & Auto-Sorting
 
-* Double-click a track to play it immediately.
+* **Tree Navigation**: Click a `[-]` / `[+]` folder header to collapse or expand it; click **All Music (Library)** to collapse the whole collection tree.
+* **AUTO-SORT**: Click the **AUTO-SORT** button in the middle control column to organize unsorted tracks into genre folders via an isolated background daemon thread (click again to stop).
+* **Smart Filtering**: Type in the `search song` box to dynamically filter matching tracks and auto-expand their parent genres; `Up`/`Down` move between matches, `Enter` picks one, and `Esc` clears the search.
+* Double-click an actual track to play it immediately.
 * Select one or more tracks (`Ctrl`/`Shift`-click) and hit **Enqueue >>** to add them to the queue.
 * Right-click a track for a quick context menu (Play / Add to Queue).
 * **<< Remove** takes the selected track(s) out of the queue.
@@ -102,7 +106,7 @@ Change this if your username or music folder ever differs. If the folder is miss
 | File | Purpose |
 | --- | --- |
 | `wavestack.py` | The whole application: GUI, audio engine, playback logic |
-| `requirements.txt` | Python dependencies (`python-vlc`, `requests`, `mutagen`, `Pillow`) |
+| `requirements.txt` | Python dependencies (`python-vlc`, `requests`, `mutagen`, `Pillow`, `numpy`) |
 | `WaveStack.desktop` | App launcher entry for GNOME/KDE |
 | `run.sh` | Wrapper that launches `wavestack.py` with the right venv |
 | `SETUP.md` | Step-by-step install commands, explained |
@@ -111,8 +115,9 @@ Change this if your username or music folder ever differs. If the folder is miss
 ## How It Works
 
 * **GUI:** classic (non-`ttk`) Tkinter widgets. Unlike themed `ttk` widgets, these are rendered by Tk itself rather than your desktop's theme, so the beveled borders and chunky buttons look authentically retro everywhere, with no stylesheet fighting required.
-* **Audio:** [libVLC](https://www.videolan.org/vlc/libvlc.html?utm_source=gemini) via `python-vlc`. VLC's own audio pipeline handles PipeWire/PulseAudio compatibility, reliable seeking, and format quirks far more robustly than pure-Python audio libraries.
+* **Audio:** [libVLC](https://www.videolan.org/vlc/libvlc.html) via `python-vlc`. VLC's own audio pipeline handles PipeWire/PulseAudio compatibility, reliable seeking, and format quirks far more robustly than pure-Python audio libraries.
 * **Threading:** VLC fires playback events (track ended, playback error) on its own internal thread. WaveStack never touches Tkinter widgets from that thread directly — events are placed on a thread-safe queue and drained by the main window's own periodic timer instead. Network requests for lyrics are isolated to their own background thread.
+* **Offline Classification & Threading:** When `AUTO-SORT` is triggered, audio slicing and spectral feature computations run strictly in an isolated background daemon thread. Live progress updates are safely pushed across a thread-safe FIFO queue to the main Tkinter event loop, ensuring zero stutter in the spinning vinyl animation or active audio playback.
 * **Window chrome:** the title bar and minimize/close buttons are drawn by your window manager, not WaveStack. Ubuntu 26.04 runs Wayland-only, where custom-positioned, undecorated windows are unreliable, so everything *inside* the window is retro-styled while the outer frame stays native for compatibility.
 
 ## Troubleshooting

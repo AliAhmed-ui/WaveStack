@@ -224,6 +224,27 @@ CRT_ACTIVE_BG   = "#00FF66"   # reverse-video highlight background
 CRT_ACTIVE_FG   = "#000000"   # reverse-video highlight foreground (black)
 CRT_BANNER_FG   = "#00AA44"   # slightly dimmer than active, for the title banner
 
+# Accent colours picked with the four buttons under the vinyl. They retint
+# the lyrics terminal and the LCD marquee (the "hardware" displays), which
+# are otherwise fixed. Green is the stock look: LCD is None so the marquee
+# falls back to the theme's own LCD colours.
+ACCENT_ORDER = ("red", "green", "blue", "yellow")
+ACCENTS = {
+    "red":    {"button": "#E02020", "bg": "#150505", "active": "#FF4040",
+               "dim": "#7A1F1F", "banner": "#CC3333", "trough": "#550000",
+               "lcd_bg": "#2A0808", "lcd_fg": "#FF5050"},
+    "green":  {"button": "#20B040", "bg": CRT_BG, "active": CRT_FG_ACTIVE,
+               "dim": CRT_FG_DIM, "banner": CRT_BANNER_FG,
+               "trough": "#005522", "lcd_bg": None, "lcd_fg": None},
+    "blue":   {"button": "#2060E0", "bg": "#050A18", "active": "#4DA6FF",
+               "dim": "#1F4A80", "banner": "#3377CC", "trough": "#002255",
+               "lcd_bg": "#081028", "lcd_fg": "#5CB0FF"},
+    "yellow": {"button": "#E8C820", "bg": "#151205", "active": "#FFE033",
+               "dim": "#7A6A1A", "banner": "#CCB02A", "trough": "#554400",
+               "lcd_bg": "#2A2408", "lcd_fg": "#FFE640"},
+}
+DEFAULT_ACCENT = "green"
+
 # --------------------------------------------------------------------------
 # Playback modes
 # --------------------------------------------------------------------------
@@ -1323,6 +1344,13 @@ class NowPlayingDisplay(tk.Frame):
             self.x, 16, text=self.text, fill=LCD_FG, font=self.font,
             anchor="w")
         self.canvas.bind("<Configure>", lambda e: self._reset_scroll())
+        self._accent = None   # (bg, fg) override from the colour buttons
+
+    def set_accent(self, bg, fg):
+        """Override the LCD colours (None, None restores the theme's)."""
+        self._accent = (bg, fg) if bg and fg else None
+        self.canvas.configure(bg=bg or LCD_BG)
+        self.canvas.itemconfigure(self.text_id, fill=fg or LCD_FG)
 
     def set_text(self, text):
         self.text = (text or "").upper()
@@ -1348,8 +1376,10 @@ class NowPlayingDisplay(tk.Frame):
 
     def apply_theme(self, theme):
         self.configure(bg=theme.get("border_black", BORDER_BLACK))
-        self.canvas.configure(bg=theme.get("lcd_bg", LCD_BG))
-        self.canvas.itemconfigure(self.text_id, fill=theme.get("lcd_fg", LCD_FG))
+        bg, fg = self._accent or (theme.get("lcd_bg", LCD_BG),
+                                  theme.get("lcd_fg", LCD_FG))
+        self.canvas.configure(bg=bg)
+        self.canvas.itemconfigure(self.text_id, fill=fg)
 
 
 # --------------------------------------------------------------------------
@@ -1786,8 +1816,9 @@ class CrtLyricsDisplay(tk.Frame):
     _MSG_WAITING  = "[ WAITING FOR TRACK... ]"
     _MSG_NO_LYRICS = "[ NO SYNCED LYRICS AVAILABLE ]"
 
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, on_seek=None, **kwargs):
         super().__init__(parent, bg=CRT_BG, bd=3, relief=tk.SUNKEN, **kwargs)
+        self._on_seek = on_seek   # callback(seconds) when a lyric is clicked
 
         # Title banner
         self._banner = tk.Label(
@@ -1835,10 +1866,37 @@ class CrtLyricsDisplay(tk.Frame):
         self._lines      = []   # [(timestamp_ms, lyric_text), ...]
         self._active_idx = -1   # index of currently highlighted line
 
+        self._text.bind("<Button-1>", self._on_click)
+
         self._show_message(self._MSG_WAITING)
+
+    def set_accent(self, pal):
+        """Retint the whole terminal from an ACCENTS entry."""
+        self._pal = pal
+        self.configure(bg=pal["bg"])
+        self._banner.configure(bg=pal["bg"], fg=pal["banner"])
+        self._text.configure(bg=pal["bg"], fg=pal["dim"])
+        self._scrollbar.configure(bg=pal["bg"], troughcolor=pal["bg"],
+                                  activebackground=pal["trough"])
+        self._text.tag_configure("dim", foreground=pal["dim"])
+        self._text.tag_configure("active", foreground=CRT_ACTIVE_FG,
+                                  background=pal["active"])
+        self._text.tag_configure("notice", foreground=pal["banner"])
 
     # ------------------------------------------------------------------
     # Internal helpers
+
+    def _on_click(self, event):
+        """Click a lyric line to jump playback to its timestamp.
+
+        Line N of the Text widget is _lines[N - 1] (load_track writes one
+        line per entry). Returns "break" so the click doesn't start a
+        text selection or steal focus from the transport controls."""
+        if self._on_seek and self._lines:
+            line = int(self._text.index(f"@{event.x},{event.y}").split(".")[0])
+            if 1 <= line <= len(self._lines):
+                self._on_seek(self._lines[line - 1][0] / 1000.0)
+        return "break"
 
     def _write(self, func):
         """Temporarily enable the Text widget, run *func*, then re-disable."""
@@ -2052,6 +2110,7 @@ class WaveStackApp(tk.Tk):
         # so Space/Play should restart it rather than try to un-pause it.
         self.is_stopped = True
         self._user_seeking = False
+        self._seek_jump_drag = False
         self._known_length = 0.0
         self._tick_id = None
 
@@ -2074,6 +2133,11 @@ class WaveStackApp(tk.Tk):
         self.genre_expanded = {}       # {genre_key: bool}; missing = open
         self.tree_root_expanded = True
         self._tree_filter = ""         # lowercase search query, "" = none
+        self._drag_src = None          # track path being dragged, if any
+        self._drag_active = False      # pointer has moved far enough to drag
+        self._drag_start_y = 0
+        self._drag_target = None       # (row, after) drop indicator
+        self._order_customized = False  # user has reordered the library
         self._genre_cache_dirty = False
 
         # AUTO-SORT worker state (see run_autosort_worker)
@@ -2298,6 +2362,7 @@ class WaveStackApp(tk.Tk):
             command=self._on_seek_scale_moved)
         self.seek_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
+        self.seek_scale.bind("<B1-Motion>", self._on_seek_motion)
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
         self.total_label = tk.Label(self.seek_frame, textvariable=self.total_var,
                                     bg=t["bg"], fg=t["fg"],
@@ -2397,6 +2462,9 @@ class WaveStackApp(tk.Tk):
         self.library_listbox.bind("<KP_Enter>", self._on_library_return)
         self.library_listbox.bind("<Button-3>",
                                    self.show_library_context_menu)
+        self.library_listbox.bind("<B1-Motion>", self._on_library_drag)
+        self.library_listbox.bind("<ButtonRelease-1>",
+                                   self._on_library_drop)
 
         # -- Middle buttons --
         self.mid_frame = tk.Frame(self.panes, bg=t["bg"])
@@ -2432,6 +2500,21 @@ class WaveStackApp(tk.Tk):
 
         self.vinyl = VinylDisc(self.mid_inner, theme=t)
         self.vinyl.pack(pady=(8, 2))
+
+        # Four unlabelled colour swatches that retint the lyrics terminal
+        # and LCD marquee. Their colours are fixed, like the displays.
+        self.accent_frame = tk.Frame(self.mid_inner, bg=t["bg"])
+        self.accent_frame.pack(pady=(2, 4))
+        self.accent_btns = {}
+        for name in ACCENT_ORDER:
+            btn = tk.Button(
+                self.accent_frame, text="", width=2, bd=3,
+                relief=tk.RAISED, bg=ACCENTS[name]["button"],
+                activebackground=ACCENTS[name]["button"],
+                highlightthickness=0, takefocus=0,
+                command=lambda n=name: self.set_accent(n))
+            btn.pack(side=tk.LEFT, padx=3)
+            self.accent_btns[name] = btn
 
 
         # -- Right column: Queue (top) + CRT Lyrics Terminal (bottom) --
@@ -2474,8 +2557,10 @@ class WaveStackApp(tk.Tk):
         self.queue_listbox.bind("<Button-3>", self.show_queue_context_menu)
 
         # CRT Lyrics Terminal sub-pane (bottom half)
-        self.lyrics_display = CrtLyricsDisplay(self.right_col)
+        self.lyrics_display = CrtLyricsDisplay(self.right_col,
+                                             on_seek=self.on_lyric_seek)
         self.lyrics_display.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
+        self.set_accent(DEFAULT_ACCENT)
 
     def toggle_visualizer(self):
         if self.visualizer_showing:
@@ -2635,6 +2720,8 @@ class WaveStackApp(tk.Tk):
             self.mid_frame.configure(bg=t["bg"])
         if hasattr(self, "mid_inner"):
             self.mid_inner.configure(bg=t["bg"])
+        if hasattr(self, "accent_frame"):
+            self.accent_frame.configure(bg=t["bg"])
         for btn in (getattr(self, "autosort_btn", None),
                     getattr(self, "enqueue_btn", None),
                     getattr(self, "remove_btn", None),
@@ -2706,7 +2793,7 @@ class WaveStackApp(tk.Tk):
         self._cancel_autosort()
         self._save_genre_cache_if_dirty()
         self.library_dir = directory
-        self.library_files = files
+        self.library_files = self._apply_saved_order(files, directory)
         self._shuffle_pool = []
         self.genre_cache = load_genre_cache(directory)
         self.genre_expanded = {}
@@ -2721,12 +2808,14 @@ class WaveStackApp(tk.Tk):
         record = self.genre_cache.get(os.path.basename(path))
         return record["genre"] if record else GENRE_UNSORTED
 
-    def _group_tracks_by_genre(self):
+    def _group_tracks_by_genre(self, query=None):
         """Return [(genre_key, [paths])] in display order -- core genres
         first, then any other tagged genres alphabetically, with the
-        Unsorted folder last -- honouring the current search filter.
+        Unsorted folder last -- honouring the current search filter
+        (or `query`, if given; pass "" for the whole library).
         Empty folders are left out."""
-        query = self._tree_filter
+        if query is None:
+            query = self._tree_filter
         groups = {}
         for path in self.library_files:
             if query:
@@ -2741,6 +2830,16 @@ class WaveStackApp(tk.Tk):
         if GENRE_UNSORTED in groups:
             ordered.append(GENRE_UNSORTED)
         return [(g, groups[g]) for g in ordered]
+
+    def _playback_order(self):
+        """The whole library flattened in the order the tree shows it.
+
+        Next/Prev/Repeat All walk this rather than library_files (which
+        is folder order), so playback follows the genre folders on
+        screen. Collapsed folders and the search filter are ignored on
+        purpose: hiding rows shouldn't make tracks unreachable."""
+        return [path for _, paths in self._group_tracks_by_genre("")
+                for path in paths]
 
     def refresh_library_listbox(self):
         """Rebuild the Library tree and visual_row_map from scratch.
@@ -2850,15 +2949,122 @@ class WaveStackApp(tk.Tk):
         # A plain click on a folder header toggles it. Everything else
         # (track rows, Ctrl/Shift extend-clicks) falls through to the
         # Listbox's own selection behaviour.
+        self._drag_src = None
+        self._drag_active = False
         if event.state & 0x0005:   # Shift or Control held
             return
         kind, key = self.visual_row_map.get(self._library_row_at(event),
                                             (None, None))
+        if kind == "track":
+            # Might turn into a drag-to-reorder; see _on_library_drag.
+            self._drag_src = key
+            self._drag_start_y = event.y
         if kind != "folder":
             return
         self.library_listbox.focus_set()
         self._toggle_tree_folder(key)
         return "break"
+
+    # -- drag-and-drop reordering ----------------------------------------
+    #
+    # Dragging a track row onto another track in the same genre folder
+    # moves it there. library_files is the source of truth: the tree
+    # groups it per genre keeping its order, and _playback_order() walks
+    # the tree, so Next/Prev/Repeat All follow the new order at once.
+
+    def _drop_target(self, event, src):
+        """(row, after) for the track row under the pointer, or None.
+        `after` is True when the pointer is in the lower half of it."""
+        row = self._library_row_at(event)
+        if row is None:
+            return None
+        kind, key = self.visual_row_map.get(row, (None, None))
+        if kind != "track" or key == src:
+            return None
+        if self._genre_of(key) != self._genre_of(src):
+            return None  # a track can't change folder by being dragged
+        bbox = self.library_listbox.bbox(row)
+        after = bool(bbox) and event.y > bbox[1] + bbox[3] // 2
+        return row, after
+
+    def _show_drop_indicator(self, target):
+        self._highlight_now_playing()   # resets every row's colours
+        if target is None:
+            return
+        t = self.theme
+        row, after = target
+        # No insertion line in a Listbox: tint the target row, and put
+        # a marker on the side of it the track will land on.
+        self.library_listbox.itemconfig(row, bg=t["btn_active_bg"],
+                                         fg=t["btn_fg"])
+        self.library_listbox.config(cursor="sb_down_arrow" if after
+                                    else "sb_up_arrow")
+
+    def _on_library_drag(self, event):
+        if self._drag_src is None:
+            return
+        if not self._drag_active:
+            if abs(event.y - self._drag_start_y) < 5:
+                return
+            self._drag_active = True
+        lb = self.library_listbox
+        # Autoscroll when held near the top/bottom edge.
+        if event.y < 8:
+            lb.yview_scroll(-1, "units")
+        elif event.y > lb.winfo_height() - 8:
+            lb.yview_scroll(1, "units")
+        self._drag_target = self._drop_target(event, self._drag_src)
+        self._show_drop_indicator(self._drag_target)
+        return "break"   # don't let the Listbox extend the selection
+
+    def _on_library_drop(self, event):
+        src, active = self._drag_src, self._drag_active
+        self._drag_src = None
+        self._drag_active = False
+        self._drag_target = None
+        if src is None or not active:
+            return
+        self.library_listbox.config(cursor="")
+        target = self._drop_target(event, src)
+        if target is None:
+            self._highlight_now_playing()
+            return "break"
+        row, after = target
+        dest = self.visual_row_map[row][1]
+        self._move_track(src, dest, after)
+        return "break"
+
+    def _move_track(self, src, dest, after):
+        files = self.library_files
+        if src not in files or dest not in files or src == dest:
+            return
+        files.remove(src)
+        idx = files.index(dest) + (1 if after else 0)
+        files.insert(idx, src)
+        self._order_customized = True
+        self.refresh_library_listbox()
+        row = self._row_for_entry(("track", src))
+        if row is not None:
+            self._select_library_row(row)
+        self.status_var.set(
+            f"Moved: {os.path.splitext(os.path.basename(src))[0]}")
+        self.save_state()
+
+    def _apply_saved_order(self, files, directory):
+        """Reorder freshly scanned *files* to match the order saved from
+        a previous drag-and-drop session. Files not in the saved list
+        (newly added) go last in scan order; vanished ones are ignored."""
+        state = self._load_state_file() or {}
+        saved = state.get("library_order")
+        if not (isinstance(saved, dict) and saved.get("dir") == directory
+                and isinstance(saved.get("files"), list)):
+            self._order_customized = False
+            return files
+        rank = {name: i for i, name in enumerate(saved["files"])
+                if isinstance(name, str)}
+        self._order_customized = True
+        return sorted(files, key=lambda p: rank.get(os.path.basename(p),
+                                                    len(rank)))
 
     def _on_library_double_click(self, event):
         # Tk delivers the second press of a double-click here INSTEAD of
@@ -3202,7 +3408,7 @@ class WaveStackApp(tk.Tk):
         elif self.now_playing:
             self._play_path(self.now_playing)
         elif self.library_files:
-            self._play_path(self.library_files[0])
+            self._play_path(self._playback_order()[0])
         else:
             self.status_var.set("No tracks loaded. Use File > Open Folder.")
 
@@ -3265,13 +3471,14 @@ class WaveStackApp(tk.Tk):
             path = self.history.pop()
             self._play_path(path)
         else:
-            if self.library_files and self.now_playing in self.library_files:
-                idx = self.library_files.index(self.now_playing)
+            order = self._playback_order()
+            if self.now_playing in order:
+                idx = order.index(self.now_playing)
                 if idx > 0:
-                    self._play_path(self.library_files[idx - 1])
+                    self._play_path(order[idx - 1])
                     return
                 elif self.playback_mode == MODE_REPEAT_ALL:
-                    self._play_path(self.library_files[-1])
+                    self._play_path(order[-1])
                     return
             self.status_var.set("No previous track.")
 
@@ -3306,16 +3513,17 @@ class WaveStackApp(tk.Tk):
             self._set_stopped_state()
 
     def _next_in_library(self):
-        if not self.library_files:
+        order = self._playback_order()
+        if not order:
             return None
-        if self.now_playing in self.library_files:
-            idx = self.library_files.index(self.now_playing)
-            if idx + 1 < len(self.library_files):
-                return self.library_files[idx + 1]
+        if self.now_playing in order:
+            idx = order.index(self.now_playing)
+            if idx + 1 < len(order):
+                return order[idx + 1]
             if self.playback_mode == MODE_REPEAT_ALL:
-                return self.library_files[0]
+                return order[0]
             return None
-        return self.library_files[0]
+        return order[0]
 
     def _play_path(self, path, resume_position=None):
         """Load and play *path*. If resume_position is given (seconds),
@@ -3476,8 +3684,50 @@ class WaveStackApp(tk.Tk):
         if hasattr(self, "visualizer"):
             self.visualizer.set_volume(val)
 
+    def on_lyric_seek(self, seconds):
+        """A lyric line was clicked: jump there and make sure it's playing."""
+        if not self.now_playing or self.is_stopped:
+            return
+        length = self.audio.get_length_seconds()
+        if length > 0:
+            seconds = min(seconds, max(0.0, length - 0.5))
+        self.audio.seek_seconds(seconds)
+        if self.is_paused:
+            self.audio.resume()
+            self.is_paused = False
+            self.status_var.set(
+                f"Playing: {os.path.basename(self.now_playing)}")
+        self.seek_scale.set(seconds)
+        self.elapsed_var.set(format_time(seconds))
+        self.lyrics_display.sync_to_ms(int(seconds * 1000))
+        self._sync_vinyl_spin_state()
+
+    def _seek_value_at(self, x):
+        """Scale value under pixel x, using the slider's own centre
+        positions at both ends so borders and slider width are exact."""
+        sc = self.seek_scale
+        lo, hi = float(sc.cget("from")), float(sc.cget("to"))
+        x0, x1 = sc.coords(lo)[0], sc.coords(hi)[0]
+        if x1 <= x0:
+            return lo
+        frac = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+        return lo + frac * (hi - lo)
+
     def _on_seek_press(self, event):
         self._user_seeking = True
+        self._seek_jump_drag = False
+        # Tk's default for a click in the trough is to nudge the slider
+        # one step toward the pointer; jump straight to the click instead
+        # and keep following the pointer if the button stays down.
+        if self.seek_scale.identify(event.x, event.y) != "slider":
+            self._seek_jump_drag = True
+            self.seek_scale.set(self._seek_value_at(event.x))
+            return "break"
+
+    def _on_seek_motion(self, event):
+        if self._seek_jump_drag:
+            self.seek_scale.set(self._seek_value_at(event.x))
+            return "break"
 
     def _on_seek_release(self, event):
         self._user_seeking = False
@@ -3639,6 +3889,18 @@ class WaveStackApp(tk.Tk):
                 self.toggle_sync()               # back to [ Offline ]
                 self.lrc_status_var.set(status)  # keep the reason visible
 
+    # -- accent colour --------------------------------------------------
+
+    def set_accent(self, name):
+        pal = ACCENTS.get(name)
+        if not pal:
+            return
+        self.accent_name = name
+        self.lyrics_display.set_accent(pal)
+        self.now_playing_display.set_accent(pal["lcd_bg"], pal["lcd_fg"])
+        for n, btn in self.accent_btns.items():
+            btn.configure(relief=tk.SUNKEN if n == name else tk.RAISED)
+
     # -- state persistence ---------------------------------------------------
 
     def save_state(self):
@@ -3654,7 +3916,13 @@ class WaveStackApp(tk.Tk):
                     self.audio.get_time_seconds() if self.now_playing
                     else 0.0),
                 "theme": getattr(self, "current_theme_name", DEFAULT_THEME),
+                "accent": getattr(self, "accent_name", DEFAULT_ACCENT),
             }
+            if self._order_customized and self.library_dir:
+                state["library_order"] = {
+                    "dir": self.library_dir,
+                    "files": [os.path.basename(p)
+                              for p in self.library_files]}
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f)
         except Exception:
@@ -3684,6 +3952,9 @@ class WaveStackApp(tk.Tk):
         theme = state.get("theme")
         if theme in THEMES and theme != self.current_theme_name:
             self.apply_theme(theme)
+
+        if state.get("accent") in ACCENTS:
+            self.set_accent(state["accent"])
 
         volume = state.get("volume")
         if isinstance(volume, (int, float)):
