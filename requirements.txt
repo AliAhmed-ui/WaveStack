@@ -3,3 +3,6 @@ Pillow>=9.0.0
 mutagen>=1.45.0
 requests>=2.25.1
 numpy>=1.24.0
+dbus-next>=0.2.3
+pybind11>=2.10.0
+setuptools>=61.0

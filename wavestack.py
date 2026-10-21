@@ -50,6 +50,15 @@ try:
 except ImportError:
     vlc = None
 
+# Native miniaudio engine (build with `python3 setup.py build_ext --inplace`).
+# Preferred when present; libVLC stays as the fallback backend.
+try:
+    import wavestack_audio
+    NATIVE_AUDIO_AVAILABLE = True
+except ImportError:
+    wavestack_audio = None
+    NATIVE_AUDIO_AVAILABLE = False
+
 try:
     from PIL import Image, ImageDraw, ImageTk
     PIL_AVAILABLE = True
@@ -70,6 +79,14 @@ try:
 except ImportError:
     np = None
     NUMPY_AVAILABLE = False
+
+try:
+    from dbus_next.aio import MessageBus
+    from dbus_next.service import ServiceInterface, method, dbus_property
+    from dbus_next import Variant, PropertyAccess
+    DBUS_AVAILABLE = True
+except ImportError:
+    DBUS_AVAILABLE = False
 
 
 
@@ -189,10 +206,95 @@ THEMES = {
         "menu_fg": "#E0E0E0",
         "menu_active_bg": "#005599",
         "menu_active_fg": "#FFFFFF",
-    }
+    },
+    "hotdog": {
+        "name": "hotdog",             # Windows 3.1 "Hotdog Stand": ketchup red + mustard yellow
+        "bg": "#C00000",
+        "bg_light": "#E00000",
+        "fg": "#FFFF00",
+        "title_fg": "#FFFFFF",
+        "border_black": "#000000",
+        "select_bg": "#FFFF00",
+        "select_fg": "#000000",
+        "lcd_bg": "#250000",
+        "lcd_fg": "#FFFF00",
+        "entry_bg": "#000000",
+        "entry_fg": "#FFFF00",
+        "entry_insert": "#FFFF00",
+        "search_placeholder_fg": "#999900",
+        "search_normal_fg": "#FFFF00",
+        "scale_trough": "#400000",
+        "btn_bg": "#A00000",
+        "btn_fg": "#FFFF00",
+        "btn_active_bg": "#CC0000",
+        "btn_active_fg": "#FFFFFF",
+        "menu_bg": "#C00000",
+        "menu_fg": "#FFFF00",
+        "menu_active_bg": "#000000",
+        "menu_active_fg": "#FFFF00",
+    },
+    "mac_platinum": {
+        "name": "mac_platinum",       # Mac System 7 / OS 8 "Platinum" warm grays
+        "bg": "#D4D0C8",
+        "bg_light": "#EAE7E0",
+        "fg": "#101010",
+        "title_fg": "#2B3A55",
+        "border_black": "#303030",
+        "select_bg": "#4A5D8A",
+        "select_fg": "#FFFFFF",
+        "lcd_bg": "#2A3028",
+        "lcd_fg": "#90B878",
+        "entry_bg": "#FFFFFF",
+        "entry_fg": "#101010",
+        "entry_insert": "#101010",
+        "search_placeholder_fg": "#787878",
+        "search_normal_fg": "#101010",
+        "scale_trough": "#E8E5DD",
+        "btn_bg": "#D4D0C8",
+        "btn_fg": "#101010",
+        "btn_active_bg": "#E5E2DA",
+        "btn_active_fg": "#000000",
+        "menu_bg": "#D4D0C8",
+        "menu_fg": "#101010",
+        "menu_active_bg": "#4A5D8A",
+        "menu_active_fg": "#FFFFFF",
+    },
+    "amber": {
+        "name": "amber",              # P3 amber phosphor terminal (VT220 / IBM 3270)
+        "bg": "#16120C",
+        "bg_light": "#282015",
+        "fg": "#FFB000",
+        "title_fg": "#FFA000",
+        "border_black": "#080500",
+        "select_bg": "#FFB000",
+        "select_fg": "#000000",
+        "lcd_bg": "#1F1400",
+        "lcd_fg": "#FFB800",
+        "entry_bg": "#0B0803",
+        "entry_fg": "#FFB000",
+        "entry_insert": "#FFB000",
+        "search_placeholder_fg": "#885C00",
+        "search_normal_fg": "#FFB000",
+        "scale_trough": "#282015",
+        "btn_bg": "#221A10",
+        "btn_fg": "#FFB000",
+        "btn_active_bg": "#342818",
+        "btn_active_fg": "#FFD066",
+        "menu_bg": "#16120C",
+        "menu_fg": "#FFB000",
+        "menu_active_bg": "#FFB000",
+        "menu_active_fg": "#000000",
+    },
 }
 
 DEFAULT_THEME = "light"
+
+THEME_ICONS = {"light": "☀", "dark": "🌙", "hotdog": "🌭",
+               "mac_platinum": "🍏", "amber": "⚡"}
+THEME_LABELS = {"light": "Windows 95 Light", "dark": "Retro Noir Dark",
+                "hotdog": "Windows 3.1 Hotdog Stand",
+                "mac_platinum": "Macintosh System 7 Platinum",
+                "amber": "Amber CRT Terminal"}
 
 # Backward-compatibility alias constants (referencing default light theme)
 BG = THEMES["light"]["bg"]
@@ -303,6 +405,59 @@ _FONT_PREFERENCE = [
     "Courier New",
     "Courier",
 ]
+
+
+# 16x16 pixel-art toolbar icons. '#' pixels take the button's foreground
+# colour, so they follow the theme; '.' is transparent.
+_ICON_BITMAPS = {
+    "folder": [
+        "................",
+        "................",
+        "..####..........",
+        ".######.........",
+        ".#....#########.",
+        ".#.............#",
+        ".#.............#",
+        ".#.............#",
+        ".#.............#",
+        ".#.............#",
+        ".#.............#",
+        ".###############",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    "refresh": [
+        "................",
+        "................",
+        ".....#####......",
+        "...#########....",
+        "..####....####..",
+        "..###......###..",
+        ".###....#######.",
+        ".###.....#####..",
+        ".###......###...",
+        ".###.......#....",
+        "..###...........",
+        "..####....####..",
+        "...#########....",
+        ".....#####......",
+        "................",
+        "................",
+    ],
+}
+
+
+def make_icon_image(name, color):
+    """Return a tk.PhotoImage of the named toolbar icon in *color*.
+    The caller must keep a reference to it or Tk will blank it."""
+    img = tk.PhotoImage(width=16, height=16)
+    for y, row in enumerate(_ICON_BITMAPS[name]):
+        for x, ch in enumerate(row):
+            if ch == "#":
+                img.put(color, (x, y))
+    return img
 
 
 def get_retro_font(widget, size=9, bold=False):
@@ -643,7 +798,15 @@ def decode_pcm_slice(filepath, ffmpeg_path):
     """Decode a short mono slice of *filepath* to float samples in
     [-1, 1] via an ffmpeg subprocess. Returns a numpy array, or None if
     the file can't be decoded. Tries DSP_SLICE_OFFSET_SECONDS in first;
-    falls back to the very start for tracks shorter than that."""
+    falls back to the very start for tracks shorter than that. Uses the
+    native decoder when built; ffmpeg is only the fallback."""
+    if NATIVE_AUDIO_AVAILABLE:
+        for offset in (DSP_SLICE_OFFSET_SECONDS, 0):
+            samples = wavestack_audio.decode_file(
+                filepath, DSP_SAMPLE_RATE, offset, DSP_SLICE_SECONDS)
+            if len(samples) >= DSP_SAMPLE_RATE * 3:   # at least 3s of audio
+                return samples
+        return None
     for offset in (DSP_SLICE_OFFSET_SECONDS, 0):
         cmd = [ffmpeg_path, "-nostdin", "-v", "error",
                "-ss", str(offset), "-t", str(DSP_SLICE_SECONDS),
@@ -870,7 +1033,7 @@ def run_autosort_worker(files, known, out, cancel):
             ffmpeg_path = shutil.which("ffmpeg")
             if not NUMPY_AVAILABLE:
                 stats["note"] = "DSP skipped: numpy not installed"
-            elif not ffmpeg_path:
+            elif not ffmpeg_path and not NATIVE_AUDIO_AVAILABLE:
                 stats["note"] = "DSP skipped: ffmpeg not installed"
             else:
                 total = len(pending)
@@ -1158,6 +1321,67 @@ def fetch_synced_lyrics(info, cancel):
     return None
 
 
+# Tracks LRCLIB definitively doesn't have lyrics for. Remembered per music
+# folder so "Go Online" doesn't re-query them on every run. Keyed by MP3
+# filename with the file size as a fingerprint, so a replaced file is
+# looked up again. Network failures are NOT recorded here -- only a clean
+# "not found" answer.
+LYRICS_MISSING_NAME = ".wavestack_lyrics_missing.json"
+
+
+def _lyrics_missing_paths(directory):
+    digest = hashlib.md5(
+        os.path.abspath(directory).encode("utf-8", "replace")).hexdigest()
+    return [os.path.join(directory, LYRICS_MISSING_NAME),
+            os.path.join(GENRE_CACHE_FALLBACK_DIR,
+                         "lyrics_missing_" + digest + ".json")]
+
+
+def load_lyrics_missing(directory):
+    """Return {mp3 filename: size in bytes}. Never raises."""
+    if not directory:
+        return {}
+    for path in _lyrics_missing_paths(directory):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            tracks = data.get("tracks") if isinstance(data, dict) else None
+            if isinstance(tracks, dict):
+                return {k: v for k, v in tracks.items()
+                        if isinstance(k, str) and isinstance(v, int)}
+        except Exception:
+            continue
+    return {}
+
+
+def save_lyrics_missing(directory, missing):
+    """Best-effort write; returns True on success."""
+    if not directory:
+        return False
+    payload = {"version": 1, "tracks": missing}
+    for path in _lyrics_missing_paths(directory):
+        tmp_path = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return False
+
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return -1
+
+
 def run_lyrics_sync_worker(directory, fallback_files, out, cancel):
     """Online-sync background thread body: for every MP3 with no .lrc
     beside it, try to download synced lyrics from LRCLIB.
@@ -1181,6 +1405,26 @@ def run_lyrics_sync_worker(directory, fallback_files, out, cancel):
         out.put(("status", f"All {len(files)} tracks already have lyrics."))
         return
 
+    # Skip tracks a previous run already learned LRCLIB doesn't have.
+    known_missing = load_lyrics_missing(directory) if directory else {}
+    total_missing = len(missing)
+    missing = [p for p in missing
+               if known_missing.get(os.path.basename(p)) != _file_size(p)]
+    skipped = total_missing - len(missing)
+    if not missing:
+        out.put(("status", f"No new tracks to look up "
+                           f"({skipped} known not on LRCLIB)."))
+        return
+    # Drop entries for files that now have a .lrc or no longer exist.
+    live = {os.path.basename(p) for p in files}
+    known_missing = {k: v for k, v in known_missing.items() if k in live}
+
+    _sync_missing_tracks(directory, missing, known_missing, out, cancel,
+                         skipped)
+
+
+def _sync_missing_tracks(directory, missing, known_missing, out, cancel,
+                         skipped):
     downloaded = not_found = failed = consecutive_failures = 0
     for i, mp3_path in enumerate(missing):
         if cancel.is_set():
@@ -1218,12 +1462,17 @@ def run_lyrics_sync_worker(directory, fallback_files, out, cancel):
                 failed += 1
         else:
             not_found += 1
+            if directory:
+                known_missing[os.path.basename(mp3_path)] = _file_size(mp3_path)
+                save_lyrics_missing(directory, known_missing)
         if cancel.wait(0.3):   # be polite to a free public API
             return
 
     summary = f"Lyrics sync done: {downloaded} downloaded"
     if not_found:
         summary += f", {not_found} not on LRCLIB"
+    if skipped:
+        summary += f", {skipped} skipped (known missing)"
     if failed:
         summary += f", {failed} failed (toggle again to retry)"
     out.put(("status", summary + "."))
@@ -1262,8 +1511,8 @@ class RetroDialog(tk.Toplevel):
         icon_glyph = self.ICON_GLYPHS.get(kind, "i")
         icon_color_map = {
             "info": theme["title_fg"],
-            "warning": "#C89600" if theme["name"] == "dark" else "#806000",
-            "error": "#FF4D4D" if theme["name"] == "dark" else "#800000"
+            "warning": "#C89600" if theme["name"] in ("dark", "amber", "hotdog") else "#806000",
+            "error": "#FF4D4D" if theme["name"] in ("dark", "amber") else "#FFFFFF" if theme["name"] == "hotdog" else "#800000"
         }
         icon_color = icon_color_map.get(kind, theme["fg"])
         icon_frame = tk.Frame(content, bg=theme["entry_bg"], bd=2, relief=tk.SUNKEN,
@@ -1590,13 +1839,12 @@ class VinylDisc(tk.Frame):
             self.canvas.itemconfig(self._image_item, image=photo)
 
 class Visualizer(tk.Frame):
-    """A simulated, 90s-style LED spectrum analyzer.
- 
-    Extracting real-time PCM sample data from libVLC in pure Python
-    is fragile and version-dependent -- it generally needs a custom
-    audio callback wired up through ctypes against a specific libvlc
-    build, which is a poor fit for a robustness-first app. Instead,
-    this draws a convincing, audio-reactive-*looking* bar animation:
+    """A 90s-style LED spectrum analyzer.
+
+    With the native engine the bar heights are real: wavestack_audio
+    computes the FFT, band levels and smoothing in C++ and this widget
+    only draws them. With the libVLC backend (no PCM access) it falls
+    back to a simulated, audio-reactive-*looking* animation:
     each bar occasionally rolls a new random target height, then
     eases toward it with a fast attack and a slower decay -- the same
     asymmetry real level meters use, since it reads as musical motion
@@ -1650,6 +1898,7 @@ class Visualizer(tk.Frame):
         ]
         self._segment_ids = [[] for _ in range(self.BAR_COUNT)]
         self._hint_id = None
+        self._spectrum_source = None
  
         self.canvas.bind("<Configure>", lambda e: self._layout(e.width, e.height))
         self.canvas.bind("<Escape>", lambda e: self._request_close())
@@ -1675,6 +1924,12 @@ class Visualizer(tk.Frame):
  
     def set_volume(self, percent):
         self._volume_percent = max(0, min(100, int(percent)))
+
+    def set_spectrum_source(self, source):
+        """*source(bar_count)* returns real, already-smoothed bar heights
+        (0..1) from the native engine. Without one, or if it fails, the
+        simulated animation below is used instead."""
+        self._spectrum_source = source
  
     def start_animating(self):
         if self._running and self._after_id is not None:
@@ -1716,6 +1971,15 @@ class Visualizer(tk.Frame):
         self._after_id = None
         if not self._running:
             return
+        if self._spectrum_source is not None:
+            try:
+                bars = self._spectrum_source(self.BAR_COUNT)
+                self._heights = [float(v) for v in bars]
+                self._render_frame()
+                self._after_id = self.after(self.TICK_MS, self._tick)
+                return
+            except Exception:
+                self._spectrum_source = None  # fall back to the simulation
         vol_scale = self._volume_percent / 100.0
         for i in range(self.BAR_COUNT):
             if random.random() < self._reroll_chance[i]:
@@ -1997,6 +2261,115 @@ class CrtLyricsDisplay(tk.Frame):
 
 
 # --------------------------------------------------------------------------
+# Seven-segment time readout
+# --------------------------------------------------------------------------
+
+SEG_BG  = "#061406"   # dark unlit glass
+SEG_ON  = "#33FF66"   # lit segment
+SEG_OFF = "#0F2E17"   # ghost of an unlit segment
+
+# Segments (a=top, b=top-right, c=bottom-right, d=bottom, e=bottom-left,
+# f=top-left, g=middle) lit for each digit.
+_SEG_DIGITS = {
+    "0": "abcdef", "1": "bc",     "2": "abdeg",   "3": "abcdg", "4": "bcfg",
+    "5": "acdfg",  "6": "acdefg", "7": "abc",     "8": "abcdefg", "9": "abcdfg",
+}
+
+
+class SevenSegmentDisplay(tk.Frame):
+    """MM:SS readout drawn as 7-segment digits with a blinking colon.
+
+    Bound to a StringVar holding "MM:SS", so callers just keep setting the
+    variable. A fixed-colour "hardware" display: not touched by apply_theme.
+    Owns a 500 ms ``after`` loop for the colon; call shutdown() on close."""
+
+    DW, DH, T = 10, 20, 3        # digit width/height, segment thickness
+    GAP, PAD, COLON_W = 4, 4, 10
+
+    def __init__(self, parent, variable):
+        super().__init__(parent, bg=BORDER_BLACK, bd=2, relief=tk.SUNKEN)
+        self.variable = variable
+        width = 4 * self.DW + 3 * self.GAP + self.COLON_W + 2 * self.PAD
+        self.canvas = tk.Canvas(self, bg=SEG_BG, width=width,
+                                height=self.DH + 2 * self.PAD,
+                                highlightthickness=0)
+        self.canvas.pack()
+        self._digit_items = []   # per digit: {segment letter: polygon id}
+        self._colon_items = []
+        self._colon_on = False   # first _blink() lights it
+        self._on, self._off = SEG_ON, SEG_OFF
+        self._after_id = None
+        self._build()
+        self.variable.trace_add("write", lambda *a: self._refresh())
+        self._refresh()
+        self._blink()
+
+    def _segment_polys(self, x, y):
+        w, h, t = self.DW, self.DH, self.T
+        m = y + h // 2
+        b = y + h
+        return {
+            "a": [x+1, y, x+w-1, y, x+w-t, y+t, x+t, y+t],
+            "b": [x+w, y+1, x+w, m-1, x+w-t+1, m-1, x+w-t, y+t+1],
+            "c": [x+w, m+1, x+w, b-1, x+w-t, b-t-1, x+w-t+1, m+1],
+            "d": [x+1, b, x+w-1, b, x+w-t, b-t, x+t, b-t],
+            "e": [x, m+1, x+t-1, m+1, x+t, b-t-1, x, b-1],
+            "f": [x, y+1, x+t, y+t+1, x+t-1, m-1, x, m-1],
+            "g": [x+t, m-1, x+w-t, m-1, x+w-1, m, x+w-t, m+1, x+t, m+1, x+1, m],
+        }
+
+    def _build(self):
+        x, y = self.PAD, self.PAD
+        for i in range(4):
+            if i == 2:
+                cx = x + 3
+                for cy in (y + self.DH * 0.3, y + self.DH * 0.7):
+                    self._colon_items.append(self.canvas.create_rectangle(
+                        cx, cy - 1, cx + 3, cy + 2, fill=self._on, outline=""))
+                x += self.COLON_W
+            self._digit_items.append({
+                k: self.canvas.create_polygon(v, fill=self._off, outline="")
+                for k, v in self._segment_polys(x, y).items()})
+            x += self.DW + self.GAP
+
+    def _refresh(self):
+        try:
+            mins, secs = self.variable.get().split(":")
+            digits = mins.zfill(2)[-2:] + secs.zfill(2)[-2:]
+        except ValueError:
+            digits = "0000"
+        for segs, ch in zip(self._digit_items, digits):
+            lit = _SEG_DIGITS.get(ch, "")
+            for seg, pid in segs.items():
+                self.canvas.itemconfigure(
+                    pid, fill=self._on if seg in lit else self._off)
+
+    def set_accent(self, pal):
+        """Recolour to match the lyrics terminal's accent palette."""
+        self._on, self._off = pal["active"], pal["trough"]
+        self.canvas.configure(bg=pal["bg"])
+        self._refresh()
+        for pid in self._colon_items:
+            self.canvas.itemconfigure(
+                pid, fill=self._on if self._colon_on else self._off)
+
+    def _blink(self):
+        self._colon_on = not self._colon_on
+        for pid in self._colon_items:
+            self.canvas.itemconfigure(
+                pid, fill=self._on if self._colon_on else self._off)
+        self._after_id = self.after(500, self._blink)
+
+    def shutdown(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+
+# --------------------------------------------------------------------------
 # Audio engine (libVLC wrapper)
 # --------------------------------------------------------------------------
 
@@ -2070,6 +2443,304 @@ class AudioEngine:
             pass
 
 
+class NativeAudioEngine:
+    """Same interface as AudioEngine, backed by the C++ miniaudio module
+    (wavestack_audio). The track is fully decoded in memory, so duration
+    is known the moment load() returns and position comes from the
+    audio device's own clock. There are no callbacks into Python:
+    poll_events() derives "ended" by polling the engine's finished flag
+    from the main thread."""
+
+    def __init__(self):
+        self._engine = wavestack_audio.AudioEngine()
+        self._end_reported = False
+
+    def poll_events(self):
+        if not self._end_reported and self._engine.is_finished():
+            self._end_reported = True
+            self._engine.pause()  # park the device instead of streaming silence
+            return ["ended"]
+        return []
+
+    def load(self, filepath):
+        self._engine.stop()
+        self._engine.load_file(filepath)
+        self._end_reported = False
+
+    def play(self):
+        self._end_reported = False
+        self._engine.play()
+
+    def pause(self):
+        self._engine.pause()
+
+    def resume(self):
+        self._engine.play()
+
+    def stop(self):
+        self._engine.stop()
+        self._end_reported = False
+
+    def set_volume(self, percent):
+        self._engine.set_volume(max(0, min(100, int(percent))) / 100.0)
+
+    def seek_seconds(self, seconds):
+        self._engine.seek_ms(max(0.0, seconds * 1000.0))
+        self._end_reported = False
+
+    def get_time_seconds(self):
+        return self._engine.get_position_ms() / 1000.0
+
+    def get_length_seconds(self):
+        return self._engine.get_duration_ms() / 1000.0
+
+    def get_spectrum(self, bands):
+        """Smoothed 0..1 bar heights computed in C++ for the audible moment."""
+        return self._engine.get_spectrum(bands)
+
+    def release(self):
+        try:
+            self._engine.stop()
+        except Exception:
+            pass
+        self._engine = None
+
+
+def create_audio_engine():
+    """Native engine if it is built and an output device opens;
+    otherwise libVLC."""
+    if NATIVE_AUDIO_AVAILABLE:
+        try:
+            return NativeAudioEngine()
+        except Exception:
+            pass
+    return AudioEngine()
+
+
+# --------------------------------------------------------------------------
+# System media keys (MPRIS2 over D-Bus)
+# --------------------------------------------------------------------------
+
+class MediaKeyService:
+    """Registers WaveStack on the session bus as an MPRIS2 player so the
+    desktop's media keys, Bluetooth/headphone buttons and the shell's
+    media widget can control it even while another app has focus. Tk
+    key bindings can't do that: they only fire for the focused window.
+
+    The D-Bus work runs on its own thread with its own asyncio loop.
+    Incoming commands ("play_pause", "next", ...) are only queued here;
+    the Tk main thread drains them through poll_commands() (same pattern
+    as AudioEngine) so no Tk or VLC call ever happens off-thread.
+
+    Fails soft: without dbus-next or a session bus, `available` stays
+    False and the app simply has no media-key support."""
+
+    BUS_NAME = "org.mpris.MediaPlayer2.WaveStack"
+    OBJECT_PATH = "/org/mpris/MediaPlayer2"
+
+    def __init__(self):
+        self.available = False
+        self._commands = queue.Queue()
+        self._loop = None
+        self._player = None
+        self._ready = threading.Event()
+        if not DBUS_AVAILABLE:
+            return
+        try:
+            threading.Thread(target=self._run, name="wavestack-mpris",
+                             daemon=True).start()
+            self._ready.wait(timeout=3.0)
+        except Exception:
+            self.available = False
+
+    def poll_commands(self):
+        out = []
+        while True:
+            try:
+                out.append(self._commands.get_nowait())
+            except queue.Empty:
+                return out
+
+    def update(self, status, title, length_seconds):
+        """Main thread -> bus: publish playback state. Cheap and
+        idempotent; only emits PropertiesChanged when something moved."""
+        if not self.available or self._loop is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(
+                self._player.apply_state, status, title,
+                int(max(0.0, length_seconds) * 1_000_000))
+        except Exception:
+            pass
+
+    def shutdown(self):
+        if self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
+
+    # -- bus thread -----------------------------------------------------
+
+    def _run(self):
+        import asyncio
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._serve())
+        except Exception:
+            self.available = False
+            self._ready.set()
+            return
+        try:
+            self._loop.run_forever()
+        except Exception:
+            pass
+
+    async def _serve(self):
+        bus = await MessageBus().connect()
+        self._player = _MprisPlayer(self._commands.put)
+        bus.export(self.OBJECT_PATH, _MprisRoot(self._commands.put))
+        bus.export(self.OBJECT_PATH, self._player)
+        await bus.request_name(self.BUS_NAME)
+        self.available = True
+        self._ready.set()
+
+
+if DBUS_AVAILABLE:
+    class _MprisRoot(ServiceInterface):
+        def __init__(self, send):
+            super().__init__("org.mpris.MediaPlayer2")
+            self._send = send
+
+        @method()
+        def Raise(self):
+            self._send("raise")
+
+        @method()
+        def Quit(self):
+            self._send("quit")
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanQuit(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanRaise(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def HasTrackList(self) -> "b":
+            return False
+
+        @dbus_property(access=PropertyAccess.READ)
+        def Identity(self) -> "s":
+            return "WaveStack"
+
+        @dbus_property(access=PropertyAccess.READ)
+        def DesktopEntry(self) -> "s":
+            return "WaveStack"  # matches WaveStack.desktop
+
+        @dbus_property(access=PropertyAccess.READ)
+        def SupportedUriSchemes(self) -> "as":
+            return ["file"]
+
+        @dbus_property(access=PropertyAccess.READ)
+        def SupportedMimeTypes(self) -> "as":
+            return ["audio/mpeg"]
+
+    class _MprisPlayer(ServiceInterface):
+        def __init__(self, send):
+            super().__init__("org.mpris.MediaPlayer2.Player")
+            self._send = send
+            self._status = "Stopped"
+            self._title = ""
+            self._length_us = 0
+
+        def apply_state(self, status, title, length_us):
+            changed = (status, title, length_us) != (
+                self._status, self._title, self._length_us)
+            self._status, self._title, self._length_us = status, title, length_us
+            if changed:
+                self.emit_properties_changed({
+                    "PlaybackStatus": status, "Metadata": self._metadata()})
+
+        def _metadata(self):
+            meta = {"mpris:trackid": Variant(
+                "o", "/org/wavestack/track" if self._title else
+                "/org/mpris/MediaPlayer2/TrackList/NoTrack")}
+            if self._title:
+                meta["xesam:title"] = Variant("s", self._title)
+                meta["mpris:length"] = Variant("x", self._length_us)
+            return meta
+
+        @method()
+        def Play(self):
+            self._send("play")
+
+        @method()
+        def Pause(self):
+            self._send("pause")
+
+        @method()
+        def PlayPause(self):
+            self._send("play_pause")
+
+        @method()
+        def Stop(self):
+            self._send("stop")
+
+        @method()
+        def Next(self):
+            self._send("next")
+
+        @method()
+        def Previous(self):
+            self._send("prev")
+
+        @dbus_property(access=PropertyAccess.READ)
+        def PlaybackStatus(self) -> "s":
+            return self._status
+
+        @dbus_property(access=PropertyAccess.READ)
+        def Metadata(self) -> "a{sv}":
+            return self._metadata()
+
+        @dbus_property(access=PropertyAccess.READ)
+        def Rate(self) -> "d":
+            return 1.0
+
+        @dbus_property(access=PropertyAccess.READ)
+        def Position(self) -> "x":
+            return 0
+
+        # Always advertised so a key press is never filtered out by the
+        # shell; the app handles "nothing loaded" itself.
+        @dbus_property(access=PropertyAccess.READ)
+        def CanGoNext(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanGoPrevious(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanPlay(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanPause(self) -> "b":
+            return True
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanSeek(self) -> "b":
+            return False
+
+        @dbus_property(access=PropertyAccess.READ)
+        def CanControl(self) -> "b":
+            return True
+
+
 # --------------------------------------------------------------------------
 # Main application window
 # --------------------------------------------------------------------------
@@ -2095,7 +2766,9 @@ class WaveStackApp(tk.Tk):
         self.font_bold = get_retro_font(self, 9, bold=True)
         self.font_title = get_retro_font(self, 14, bold=True)
 
-        self.audio = AudioEngine()
+        self.audio = create_audio_engine()
+        self.media_keys = MediaKeyService()
+        self._mpris_title_cache = (None, "")
 
         self.library_dir = None
         self.library_files = []
@@ -2199,7 +2872,7 @@ class WaveStackApp(tk.Tk):
         self.file_menu.add_command(label="Find in Library...",
                                command=self._on_focus_search_shortcut,
                                accelerator="Ctrl+F")
-        self.file_menu.add_command(label="Toggle Dark/Light Mode",
+        self.file_menu.add_command(label="Next Theme",
                                command=self.toggle_theme,
                                accelerator="F10")
         self.file_menu.add_separator()
@@ -2228,12 +2901,22 @@ class WaveStackApp(tk.Tk):
                                    command=self.cycle_playback_mode)
         self.menubar.add_cascade(label="Playback", menu=playback_menu)
 
+        self.theme_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+                                  fg=t["menu_fg"],
+                                  activebackground=t["menu_active_bg"],
+                                  activeforeground=t["menu_active_fg"],
+                                  font=self.font_normal)
+        for key, label in THEME_LABELS.items():
+            self.theme_menu.add_command(
+                label=label, command=lambda k=key: self.set_theme(k))
+        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
+
         self.help_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
                                  fg=t["menu_fg"],
                                  activebackground=t["menu_active_bg"],
                                  activeforeground=t["menu_active_fg"],
                                  font=self.font_normal)
-        self.help_menu.add_command(label="Toggle Dark/Light Mode",
+        self.help_menu.add_command(label="Next Theme",
                                command=self.toggle_theme)
         self.help_menu.add_separator()
         self.help_menu.add_command(label="About WaveStack...",
@@ -2278,7 +2961,7 @@ class WaveStackApp(tk.Tk):
         self.title_label.pack(side=tk.LEFT, padx=10, pady=6)
 
         # Theme toggle button in top right corner
-        theme_icon = "☀" if self.current_theme_name == "light" else "🌙"
+        theme_icon = THEME_ICONS.get(self.current_theme_name, "🎨")
         self.theme_btn = tk.Button(
             self.header_frame, text=theme_icon,
             command=self.toggle_theme,
@@ -2343,16 +3026,27 @@ class WaveStackApp(tk.Tk):
                                   padx=6)
         self.mode_btn.pack(side=tk.LEFT, padx=3, pady=3)
 
-        self.open_folder_btn = make_button(self.transport_frame, "Open Folder...",
-                                            self.on_open_folder)
+        # Icon-only buttons: open-folder on the far right, with refresh
+        # (re-scan the current folder) immediately to its left. Packed
+        # right-to-left, so the folder button goes in first.
+        self._icon_images = {}
+        def make_icon_button(icon, command):
+            img = make_icon_image(icon, t["btn_fg"])
+            self._icon_images[icon] = img
+            return tk.Button(self.transport_frame, image=img, command=command,
+                             bg=t["btn_bg"], relief=tk.RAISED, bd=3,
+                             activebackground=t["btn_active_bg"],
+                             padx=2, pady=2)
+
+        self.open_folder_btn = make_icon_button("folder", self.on_open_folder)
         self.open_folder_btn.pack(side=tk.RIGHT, padx=3, pady=3)
+        self.refresh_btn = make_icon_button("refresh", self.on_refresh_library)
+        self.refresh_btn.pack(side=tk.RIGHT, padx=3, pady=3)
 
         # Seek bar
         self.seek_frame = tk.Frame(self.outer_frame, bg=t["bg"])
         self.seek_frame.pack(fill=tk.X, padx=6, pady=(6, 2))
-        self.elapsed_label = tk.Label(self.seek_frame, textvariable=self.elapsed_var,
-                                      bg=t["bg"], fg=t["fg"],
-                                      font=self.font_normal, width=6)
+        self.elapsed_label = SevenSegmentDisplay(self.seek_frame, self.elapsed_var)
         self.elapsed_label.pack(side=tk.LEFT)
         self.seek_scale = tk.Scale(
             self.seek_frame, from_=0, to=100, orient=tk.HORIZONTAL,
@@ -2364,9 +3058,7 @@ class WaveStackApp(tk.Tk):
         self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
         self.seek_scale.bind("<B1-Motion>", self._on_seek_motion)
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
-        self.total_label = tk.Label(self.seek_frame, textvariable=self.total_var,
-                                    bg=t["bg"], fg=t["fg"],
-                                    font=self.font_normal, width=6)
+        self.total_label = SevenSegmentDisplay(self.seek_frame, self.total_var)
         self.total_label.pack(side=tk.LEFT)
 
         # Volume
@@ -2407,6 +3099,8 @@ class WaveStackApp(tk.Tk):
         self.visualizer_showing = False
         self.visualizer = Visualizer(self.outer_frame)
         self.visualizer.set_volume(70)
+        if hasattr(self.audio, "get_spectrum"):
+            self.visualizer.set_spectrum_source(self.audio.get_spectrum)
         # Library (col 0) and Queue+Lyrics (col 2) share one "uniform"
         # group, which makes grid give them exactly equal widths; the
         # button column between them stays at its natural width. The
@@ -2587,10 +3281,14 @@ class WaveStackApp(tk.Tk):
             return "break"
 
     def toggle_theme(self):
-        new_theme = "dark" if self.current_theme_name == "light" else "light"
-        self.apply_theme(new_theme)
+        names = list(THEMES.keys())
+        new_theme = names[(names.index(self.current_theme_name) + 1) % len(names)]
+        self.set_theme(new_theme)
+
+    def set_theme(self, theme_name):
+        self.apply_theme(theme_name)
         self.save_state()
-        self.status_var.set(f"Theme switched to {new_theme.capitalize()} Mode")
+        self.status_var.set(f"Theme switched to {THEME_LABELS.get(theme_name, theme_name)}")
 
     def apply_theme(self, theme_name):
         if theme_name not in THEMES:
@@ -2607,6 +3305,7 @@ class WaveStackApp(tk.Tk):
         for m in (getattr(self, "menubar", None),
                   getattr(self, "file_menu", None),
                   getattr(self, "playback_menu", None),
+                  getattr(self, "theme_menu", None),
                   getattr(self, "help_menu", None)):
             if m:
                 try:
@@ -2628,7 +3327,7 @@ class WaveStackApp(tk.Tk):
 
         # Theme toggle button
         if hasattr(self, "theme_btn"):
-            icon = "☀" if self.current_theme_name == "light" else "🌙"
+            icon = THEME_ICONS.get(self.current_theme_name, "🎨")
             self.theme_btn.configure(
                 text=icon,
                 bg=t["btn_bg"], fg=t["btn_fg"],
@@ -2649,22 +3348,26 @@ class WaveStackApp(tk.Tk):
                     getattr(self, "stop_btn", None),
                     getattr(self, "next_btn", None),
                     getattr(self, "visualizer_btn", None),
-                    getattr(self, "mode_btn", None),
-                    getattr(self, "open_folder_btn", None)):
+                    getattr(self, "mode_btn", None)):
             if btn:
                 btn.configure(
                     bg=t["btn_bg"], fg=t["btn_fg"],
                     activebackground=t["btn_active_bg"],
                     activeforeground=t["btn_active_fg"]
                 )
+        # Icon buttons: re-render the pixel art in the new foreground colour.
+        for icon, attr in (("folder", "open_folder_btn"),
+                           ("refresh", "refresh_btn")):
+            btn = getattr(self, attr, None)
+            if btn:
+                img = make_icon_image(icon, t["btn_fg"])
+                self._icon_images[icon] = img
+                btn.configure(image=img, bg=t["btn_bg"],
+                              activebackground=t["btn_active_bg"])
 
         # Seek
         if hasattr(self, "seek_frame"):
             self.seek_frame.configure(bg=t["bg"])
-        if hasattr(self, "elapsed_label"):
-            self.elapsed_label.configure(bg=t["bg"], fg=t["fg"])
-        if hasattr(self, "total_label"):
-            self.total_label.configure(bg=t["bg"], fg=t["fg"])
         if hasattr(self, "seek_scale"):
             self.seek_scale.configure(
                 bg=t["bg"], fg=t["fg"],
@@ -3346,6 +4049,34 @@ class WaveStackApp(tk.Tk):
         if chosen:
             self.load_folder(chosen, show_errors=True)
 
+    def on_refresh_library(self):
+        """Re-scan the current music folder and pick up added/removed MP3s.
+
+        Unlike load_folder this keeps the genre cache, tree expansion,
+        search filter and any running AUTO-SORT, so it's cheap to hit."""
+        directory = self.library_dir or DEFAULT_MUSIC_DIR
+        files = scan_mp3_files(directory)
+        if not files:
+            self.show_retro_error(
+                "No MP3 Files Found",
+                f"This folder has no .mp3 files, or doesn't exist:\n\n"
+                f"{directory}")
+            return
+        old = set(self.library_files)
+        added = len(set(files) - old)
+        removed = len(old - set(files))
+        self.library_dir = directory
+        self.library_files = self._apply_saved_order(files, directory)
+        self._shuffle_pool = []
+        self.refresh_library_listbox()
+        if added or removed:
+            self.status_var.set(
+                f"Library refreshed: {added} added, {removed} removed")
+        else:
+            self.status_var.set("Library refreshed: no changes")
+        self.lrc_status_var.set(
+            f"Refreshed: +{added} / -{removed} track(s)")
+
     # -- playback control -------------------------------------------------
 
     def on_play_pause_toggle(self):
@@ -3752,6 +4483,7 @@ class WaveStackApp(tk.Tk):
             elif event_name == "error":
                 self._handle_playback_error()
         self._drain_sync_events()
+        self._handle_media_key_commands()
 
         if self.now_playing and not self._user_seeking:
             length = self.audio.get_length_seconds()
@@ -3782,6 +4514,45 @@ class WaveStackApp(tk.Tk):
 
         self.now_playing_display.tick()
         self._tick_id = self.after(250, self._tick)
+
+    def _handle_media_key_commands(self):
+        """Runs the system media-key presses (MPRIS) queued by the D-Bus
+        thread, then publishes the current state back to the desktop."""
+        playing = bool(self.now_playing and not self.is_paused and not self.is_stopped)
+        for cmd in self.media_keys.poll_commands():
+            if cmd == "play_pause":
+                self.on_play_pause_toggle()
+            elif cmd == "play":
+                if not playing:
+                    self.on_play_clicked()
+            elif cmd == "pause":
+                self.on_pause_clicked()
+            elif cmd == "stop":
+                self.on_stop_clicked()
+            elif cmd == "next":
+                self.on_next_clicked()
+            elif cmd == "prev":
+                self.on_prev_clicked()
+            elif cmd == "raise":
+                self.deiconify()
+                self.lift()
+            elif cmd == "quit":
+                self.on_close()
+                return
+            playing = bool(self.now_playing and not self.is_paused and not self.is_stopped)
+
+        if not self.media_keys.available:
+            return
+        if self.now_playing is None:
+            status, title = "Stopped", ""
+        else:
+            status = "Playing" if playing else ("Paused" if self.is_paused else "Stopped")
+            if self._mpris_title_cache[0] != self.now_playing:
+                self._mpris_title_cache = (
+                    self.now_playing,
+                    os.path.splitext(os.path.basename(self.now_playing))[0])
+            title = self._mpris_title_cache[1]
+        self.media_keys.update(status, title, self._known_length)
 
     def _complete_pending_resume(self, length):
         """Finishes what restore_saved_state() started: waits for a
@@ -3898,6 +4669,8 @@ class WaveStackApp(tk.Tk):
         self.accent_name = name
         self.lyrics_display.set_accent(pal)
         self.now_playing_display.set_accent(pal["lcd_bg"], pal["lcd_fg"])
+        for name_ in ("elapsed_label", "total_label"):
+            getattr(self, name_).set_accent(pal)
         for n, btn in self.accent_btns.items():
             btn.configure(relief=tk.SUNKEN if n == name else tk.RAISED)
 
@@ -3987,9 +4760,13 @@ class WaveStackApp(tk.Tk):
             self.vinyl.shutdown()
         if hasattr(self, "visualizer"):
             self.visualizer.shutdown()
+        for name in ("elapsed_label", "total_label"):
+            if hasattr(self, name):
+                getattr(self, name).shutdown()
         self._cancel_autosort()
         self._save_genre_cache_if_dirty()
         self.cancel_sync.set()
+        self.media_keys.shutdown()
         self.save_state()
         self.audio.release()
         self.destroy()
@@ -4012,7 +4789,9 @@ def _fatal_startup_error(message):
 
 def main():
     global vlc
-    if vlc is None:
+    if NATIVE_AUDIO_AVAILABLE:
+        pass  # libVLC is only needed if the native engine can't open a device
+    elif vlc is None:
         venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
         if os.path.isfile(venv_python) and sys.executable != venv_python:
             os.execv(venv_python, [venv_python] + sys.argv)
@@ -4022,18 +4801,19 @@ def main():
             "run:\n  pip install -r requirements.txt")
         sys.exit(1)
 
-    try:
-        probe = vlc.Instance()
-        if probe is None:
-            raise RuntimeError("libVLC failed to initialize.")
-        probe.release()
-    except Exception as exc:
-        _fatal_startup_error(
-            "WaveStack could not start because the VLC engine is "
-            "missing or broken.\n\nInstall it with:\n"
-            "  sudo apt install vlc\n\n"
-            f"Details: {exc}")
-        sys.exit(1)
+    if not NATIVE_AUDIO_AVAILABLE:
+        try:
+            probe = vlc.Instance()
+            if probe is None:
+                raise RuntimeError("libVLC failed to initialize.")
+            probe.release()
+        except Exception as exc:
+            _fatal_startup_error(
+                "WaveStack could not start because the VLC engine is "
+                "missing or broken.\n\nInstall it with:\n"
+                "  sudo apt install vlc\n\n"
+                f"Details: {exc}")
+            sys.exit(1)
 
     try:
         app = WaveStackApp()

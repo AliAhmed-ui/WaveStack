@@ -58,16 +58,16 @@ install_system_dependencies() {
     case "$OS_FAMILY" in
         debian)
             sudo apt-get update
-            sudo apt-get install -y python3 python3-venv python3-tk vlc
+            sudo apt-get install -y python3 python3-venv python3-tk python3-dev build-essential vlc
             ;;
         fedora)
-            sudo dnf install -y python3 python3-tkinter vlc
+            sudo dnf install -y python3 python3-tkinter python3-devel gcc-c++ vlc
             ;;
         arch)
-            sudo pacman -Syu --needed --noconfirm python tk vlc
+            sudo pacman -Syu --needed --noconfirm python tk gcc vlc
             ;;
         suse)
-            sudo zypper install -y python3 python3-tk vlc
+            sudo zypper install -y python3 python3-tk python3-devel gcc-c++ vlc
             ;;
     esac
 }
@@ -79,6 +79,37 @@ install_python_dependencies() {
     echo "Installing WaveStack's Python dependencies..."
     "$VENV_DIR/bin/python3" -m pip install --upgrade pip
     "$VENV_DIR/bin/python3" -m pip install -r "$PROJECT_DIR/requirements.txt"
+}
+
+# Builds the native miniaudio engine (wavestack_audio*.so). Runs on every
+# launch but is a no-op unless the module is missing or its sources changed.
+# Fails soft: without a compiler WaveStack falls back to libVLC.
+build_native_module() {
+    local py="$VENV_DIR/bin/python3"
+    local built
+    built="$(compgen -G "$PROJECT_DIR/wavestack_audio*.so" | head -n1 || true)"
+
+    if [[ -n "$built" && "$built" -nt "$PROJECT_DIR/AudioEngine.cpp" \
+          && "$built" -nt "$PROJECT_DIR/miniaudio.h" \
+          && "$built" -nt "$PROJECT_DIR/setup.py" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$PROJECT_DIR/AudioEngine.cpp" || ! -f "$PROJECT_DIR/miniaudio.h" ]]; then
+        return 0
+    fi
+
+    echo "Building the native audio engine..."
+    local log
+    log="$(mktemp)"
+    if "$py" -m pip install --quiet pybind11 setuptools >"$log" 2>&1 \
+       && "$py" setup.py build_ext --inplace >>"$log" 2>&1; then
+        echo "Native audio engine ready."
+        rm -f "$log"
+    else
+        tail -n 15 "$log"
+        rm -f "$log"
+        echo "Native audio engine build failed (needs g++ and python3-dev); using libVLC instead."
+    fi
 }
 
 create_desktop_launcher() {
@@ -122,6 +153,8 @@ if [[ ! -f "$SETUP_MARKER" || ! -x "$VENV_DIR/bin/python3" ]]; then
 else
     create_desktop_launcher
 fi
+
+build_native_module
 
 echo "Starting WaveStack..."
 exec "$VENV_DIR/bin/python3" "$PROJECT_DIR/wavestack.py" "$@"
