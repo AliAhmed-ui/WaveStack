@@ -1856,29 +1856,23 @@ class Visualizer(tk.Frame):
     heights -- on pause, and drops flat to zero on stop. Peak bar
     heights scale with the current volume slider via set_volume().
  
-    The canvas is a fixed black-with-green-LEDs "hardware display",
-    like the LCD now-playing marquee -- deliberately NOT theme-tinted,
-    the same way a real equalizer's display doesn't repaint itself
-    when you change your desktop wallpaper. Only the frame around it
-    follows the current theme, for a tidy edge.
+    Unlike the LCD marquee, this display follows the theme: the canvas
+    uses the sunken-well colour of the lists, unlit segments are the
+    theme's hover gray, and lit bars run from the theme's accent colour
+    (navy / cyan) at the bottom toward the text colour at the peak.
     """
  
     BAR_COUNT = 28
     SEGMENTS_PER_BAR = 14
     TICK_MS = 60   # ~16 fps: smooth, but leaves plenty of headroom
  
-    CANVAS_BG = "#050505"
-    SEGMENT_OFF = "#123312"
-    SEGMENT_GREEN = "#39FF14"
-    SEGMENT_YELLOW = "#E8FF39"
-    SEGMENT_RED = "#FF3B30"
-    HINT_FG = "#2E6B2E"
  
     def __init__(self, parent, theme=None):
         if theme is None:
             theme = getattr(parent, "theme", None) or THEMES[DEFAULT_THEME]
         self.theme = theme
         super().__init__(parent, bg=theme["bg"], bd=2, relief=tk.SUNKEN)
+        self._build_palette()
  
         self.canvas = tk.Canvas(self, bg=self.CANVAS_BG, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -1917,8 +1911,26 @@ class Visualizer(tk.Frame):
     def apply_theme(self, theme):
         self.theme = theme
         self.configure(bg=theme["bg"])
-        # The canvas itself intentionally stays fixed black/green
-        # regardless of theme -- see the class docstring.
+        self._build_palette()
+        self.canvas.configure(bg=self.CANVAS_BG)
+        self._layout()
+
+    @staticmethod
+    def _blend(c1, c2, t):
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02X%02X%02X" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+    def _build_palette(self):
+        t = self.theme
+        self.CANVAS_BG = t["entry_bg"]
+        self.SEGMENT_OFF = t["bg_light"]
+        self.HINT_FG = t["search_placeholder_fg"]
+        self._lit_colors = [
+            self._blend(t["title_fg"], t["fg"],
+                        0.6 * row / max(1, self.SEGMENTS_PER_BAR - 1))
+            for row in range(self.SEGMENTS_PER_BAR)
+        ]
  
     # -- public API -----------------------------------------------
  
@@ -2039,12 +2051,7 @@ class Visualizer(tk.Frame):
         self._render_frame()
  
     def _segment_color(self, row_from_bottom):
-        frac = row_from_bottom / max(1, self.SEGMENTS_PER_BAR - 1)
-        if frac >= 0.85:
-            return self.SEGMENT_RED
-        if frac >= 0.65:
-            return self.SEGMENT_YELLOW
-        return self.SEGMENT_GREEN
+        return self._lit_colors[row_from_bottom]
  
     def _render_frame(self):
         for i, h in enumerate(self._heights):
@@ -2055,6 +2062,374 @@ class Visualizer(tk.Frame):
                 self.canvas.itemconfig(seg_id, fill=color)
  
  
+
+
+# --------------------------------------------------------------------------
+# Animated theme icon (header, top-right corner)
+# --------------------------------------------------------------------------
+
+# Each frame function takes a phase number and returns {(x, y): colour} on a
+# 16x16 grid. Phase 0 is the plain, at-rest icon; phases 1..n-1 only appear
+# while a song is actually playing. Colours are fixed (the icons are little
+# pieces of pixel art, not chrome), the canvas behind them follows the theme.
+
+def _disc(cx, cy, r2):
+    return {(x, y) for y in range(16) for x in range(16)
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r2}
+
+
+def _frame_sun(phase):
+    px = {}
+    for p in _disc(7.5, 7.5, 9.5):
+        px[p] = "#FFD400"
+    for p in ((5, 5), (6, 5), (5, 6)):
+        px[p] = "#FFF3A0"
+    ortho = [(x, y) for x in (7, 8) for y in (0, 1, 13, 14)] + \
+            [(x, y) for y in (7, 8) for x in (0, 1, 13, 14)]
+    diag = [(2, 2), (3, 3), (13, 2), (12, 3), (2, 13), (3, 12), (13, 13), (12, 12)]
+    rays = {0: ortho, 1: diag, 2: ortho + diag, 3: diag}[phase % 4]
+    for p in rays:
+        px[p] = "#FF9A00"
+    return px
+
+
+def _frame_moon(phase):
+    px = {}
+    cut = _disc(10.5, 5.5, 14)
+    for p in _disc(7.5, 8, 30):
+        if p not in cut:
+            px[p] = "#F5E6A0"
+    for p in ((4, 9), (4, 10), (5, 12)):
+        if p in px:
+            px[p] = "#D8C478"
+    for i, (sx, sy) in enumerate(((13, 2), (14, 9), (11, 13))):
+        px[(sx, sy)] = "#8FA0C8"
+        if phase and (phase + i) % 3 == 0:
+            px[(sx, sy)] = "#FFFFFF"
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                px[(sx + dx, sy + dy)] = "#C8D4F0"
+    return px
+
+
+def _frame_hotdog(phase):
+    px = {}
+    bun = "#E8B060"
+    for y in (4, 5, 9, 10):
+        for x in range(1, 15):
+            if y in (4, 10) and x in (1, 14):
+                continue
+            px[(x, y)] = bun
+    for x in range(2, 14):
+        px[(x, 4)] = "#F6CC82"
+    for y in (6, 7, 8):
+        for x in range(0, 16):
+            px[(x, y)] = "#B03A1E"
+    for x in range(1, 15):
+        px[(x, 6)] = "#CC5030"
+    for x in range(2, 14):
+        px[(x, 6 if x % 2 == 0 else 7)] = "#FFD800" if x < 8 else "#FF2A1A"
+    if phase:
+        for col, color, offset in ((4, "#FFD800", 0), (11, "#FF2A1A", 3)):
+            p = (phase + offset) % 6
+            for r in range(min(p, 2)):
+                px[(col, 11 + r)] = color
+            if p >= 2:
+                px[(col, 11 + p)] = color
+                if p < 5:
+                    px[(col, 11 + p - 1)] = color
+    return px
+
+
+def _frame_apple(phase):
+    dy = (0, -1, -2, -1, 0, 1, 0)[phase % 7]
+    px = {}
+    body = _disc(7.5, 9.5, 21)
+    body -= {(7, 4), (8, 4)}
+    for (x, y) in body:
+        px[(x, y + dy)] = "#D8261C"
+    for p in ((4, 8), (4, 9), (5, 7)):
+        px[(p[0], p[1] + dy)] = "#FF8A80"
+    for p in ((10, 12), (10, 11), (9, 13)):
+        px[(p[0], p[1] + dy)] = "#A01810"
+    for p in ((7, 3), (7, 4), (8, 2)):
+        px[(p[0], p[1] + dy)] = "#6B4220"
+    for p in ((9, 2), (10, 2), (10, 3), (11, 3)):
+        px[(p[0], p[1] + dy)] = "#3FB83A"
+    return px
+
+
+# The Flash, facing right and held in one spot while his legs and arms cycle;
+# lightning crackles off behind him (to the left) only while he is "running".
+# Per phase: (front leg, back leg, front arm, back arm), each a pixel list with
+# the boot as the last two pixels of a leg.
+_FLASH_POSES = (
+    ([(10, 8), (11, 9), (12, 10)], [(12, 11), (13, 11)],
+     [(8, 8), (7, 9), (6, 10)], [(5, 10), (5, 11)],
+     [(11, 5), (12, 5)], [(8, 5), (7, 5), (6, 6)]),
+    ([(10, 8), (10, 9), (10, 10)], [(10, 11), (11, 11)],
+     [(9, 8), (8, 9), (8, 10)], [(7, 11), (8, 11)],
+     [(11, 5), (12, 6)], [(8, 5), (7, 6)]),
+    ([(10, 8), (10, 9), (10, 10)], [(10, 11), (11, 11)],
+     [(8, 8), (7, 9), (6, 9)], [(5, 8), (4, 8)],
+     [(11, 5), (12, 4)], [(8, 5), (7, 4), (6, 4)]),
+    ([(10, 8), (11, 9), (11, 10)], [(11, 11), (12, 11)],
+     [(9, 8), (8, 9), (8, 10)], [(7, 11), (8, 11)],
+     [(11, 5), (12, 6)], [(8, 5), (7, 6)]),
+)
+
+
+def _frame_flash(phase):
+    red, dark, gold, skin = "#E02020", "#A01010", "#FFD800", "#F0C090"
+    oy = 2
+    bob = -1 if phase % 2 else 0
+    px = {}
+
+    def put(pts, color, dy=0):
+        for x, y in pts:
+            px[(x, y + oy + dy)] = color
+
+    front, f_boot, back, b_boot, f_arm, b_arm = _FLASH_POSES[phase % 4]
+    # legs and boots stay on the ground; head/torso/arms bob
+    put(back, dark)
+    put(b_boot, gold)
+    put(front, red)
+    put(f_boot, gold)
+    put(b_arm, dark, bob)
+    put([(9, 1), (10, 1), (11, 1), (9, 2), (10, 2), (9, 3), (10, 3), (11, 3),
+         (9, 4), (10, 4), (11, 4), (8, 5), (9, 5), (10, 5), (8, 6), (9, 6),
+         (10, 6), (8, 7), (9, 7), (10, 7)], red, bob)
+    put([(11, 2)], skin, bob)
+    put([(8, 1), (8, 2), (7, 1)], gold, bob)         # cowl wings
+    put([(10, 5), (9, 6)], gold, bob)                 # chest emblem
+    put([(8, 7), (9, 7), (10, 7)], gold, bob)         # belt
+    put(f_arm, red, bob)
+
+    if phase:
+        for i, (y, base) in enumerate(((5, 0), (9, 3), (12, 1))):
+            x = 5 - ((phase * 2 + base) % 6)
+            bolt = [(x, y), (x + 1, y), (x + 1, y + 1), (x + 2, y + 1)]
+            for bx, by in bolt:
+                if 0 <= bx < 6 + 1:
+                    px[(bx, by)] = "#FFE000"
+            if 0 <= x < 7:
+                px[(x, y)] = "#FFFFFF"
+    return px
+
+
+ICON_FRAMES = {
+    "light": (_frame_sun, 4),
+    "dark": (_frame_moon, 6),
+    "hotdog": (_frame_hotdog, 6),
+    "mac_platinum": (_frame_apple, 7),
+    "amber": (_frame_flash, 4),
+}
+
+
+class ThemeIcon(tk.Canvas):
+    """Tiny pixel-art icon for the current theme (sun, moon, hot dog,
+    apple, lightning bolt) that sits in the top-right corner of the header.
+
+    It animates only while a song is genuinely playing; paused, stopped
+    or idle it shows the plain phase-0 icon. Follows the usual animation
+    shape: own `after` job, start_* / pause_* / stop_and_reset / shutdown."""
+
+    GRID = 16
+    SCALE = 2
+    TICK_MS = 170
+
+    def __init__(self, parent, theme_name, theme):
+        size = self.GRID * self.SCALE
+        super().__init__(parent, width=size, height=size, bg=theme["bg"],
+                         highlightthickness=0, bd=0)
+        self._theme_name = theme_name
+        self._phase = 0
+        self._running = False
+        self._after_id = None
+        self._draw()
+
+    def set_theme(self, theme_name, theme):
+        self._theme_name = theme_name
+        self.configure(bg=theme["bg"])
+        self._draw()
+
+    def start_animating(self):
+        if self._running and self._after_id is not None:
+            return
+        self._running = True
+        self._cancel()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+
+    def pause_animating(self):
+        self.stop_and_reset()
+
+    def stop_and_reset(self):
+        self._running = False
+        self._cancel()
+        self._phase = 0
+        self._draw()
+
+    def shutdown(self):
+        self._running = False
+        self._cancel()
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _tick(self):
+        self._after_id = None
+        if not self._running:
+            return
+        count = ICON_FRAMES.get(self._theme_name, (None, 1))[1]
+        self._phase = (self._phase + 1) % count
+        self._draw()
+        self._after_id = self.after(self.TICK_MS, self._tick)
+
+    def _draw(self):
+        self.delete("all")
+        entry = ICON_FRAMES.get(self._theme_name)
+        if entry is None:
+            return
+        k = self.SCALE
+        for (x, y), color in entry[0](self._phase).items():
+            if 0 <= x < self.GRID and 0 <= y < self.GRID:
+                self.create_rectangle(x * k, y * k, x * k + k, y * k + k,
+                                      fill=color, outline="")
+
+
+# --------------------------------------------------------------------------
+# Equalizer ("Amp Control") window
+# --------------------------------------------------------------------------
+
+class EqualizerWindow(tk.Toplevel):
+    """Non-modal Bass / Mid / Treble amp panel.
+
+    Three vertical sliders (+12 dB at the top, -12 dB at the bottom) fire
+    on_change(band, db) while they are dragged; the audio engine ramps to
+    each new gain itself, so the callback can be called as often as Tk
+    likes. Every colour comes from the app theme and apply_theme()
+    repaints the window in place when the theme is toggled. The OS draws
+    the title bar and positions the window (Wayland); only the content is
+    custom-styled."""
+
+    BANDS = (("bass", "BASS"), ("mid", "MID"), ("treble", "TREBLE"))
+    RANGE_DB = 12
+
+    def __init__(self, parent, theme, gains, on_change, on_close=None):
+        super().__init__(parent)
+        self.theme = theme
+        self._on_change = on_change
+        self._on_close = on_close
+        self._scales = {}
+        self._value_labels = {}
+        self._name_labels = {}
+
+        self.title("Amp Control")
+        self.resizable(False, False)
+        self.transient(parent)
+
+        self._font = get_retro_font(self, 9)
+        self._font_bold = get_retro_font(self, 9, bold=True)
+
+        self._chassis = tk.Frame(self, bd=2, relief=tk.RAISED)
+        self._chassis.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        self._title_label = tk.Label(self._chassis, text="\u2500 AMP CONTROL \u2500",
+                                     font=self._font_bold)
+        self._title_label.pack(pady=(8, 4))
+
+        self._well = tk.Frame(self._chassis, bd=3, relief=tk.SUNKEN)
+        self._well.pack(padx=12, pady=4)
+
+        self._columns = []
+        for col, (key, label) in enumerate(self.BANDS):
+            column = tk.Frame(self._well)
+            column.grid(row=0, column=col, padx=10, pady=8)
+            self._columns.append(column)
+            value = tk.Label(column, width=7, font=self._font_bold)
+            value.pack()
+            scale = tk.Scale(
+                column, from_=self.RANGE_DB, to=-self.RANGE_DB, resolution=1,
+                orient=tk.VERTICAL, length=180, width=18, showvalue=False,
+                relief=tk.RAISED, bd=2, sliderrelief=tk.RAISED,
+                highlightthickness=0,
+                command=lambda v, k=key: self._on_scale(k, v))
+            self._scales[key] = scale
+            self._value_labels[key] = value
+            scale.set(int(round(gains.get(key, 0))))
+            scale.pack(pady=4)
+            scale.bind("<Double-Button-1>", lambda e, k=key: self._reset_band(k))
+            name = tk.Label(column, text=label, font=self._font_bold)
+            name.pack()
+            self._name_labels[key] = name
+            self._update_value_label(key)
+
+        self._hint_label = tk.Label(self._chassis, text="double-click a slider to centre",
+                                    font=self._font)
+        self._hint_label.pack(pady=(2, 0))
+        self._button_row = tk.Frame(self._chassis)
+        self._button_row.pack(fill=tk.X, padx=12, pady=(6, 10))
+        self._reset_btn = tk.Button(self._button_row, text="Flat", width=9,
+                                    font=self._font, relief=tk.RAISED, bd=3,
+                                    command=self.reset_all)
+        self._reset_btn.pack(side=tk.RIGHT)
+        self._close_btn = tk.Button(self._button_row, text="Close", width=9,
+                                    font=self._font, relief=tk.RAISED, bd=3,
+                                    command=self.close)
+        self._close_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: (self.close(), "break")[1])
+        self.apply_theme(theme)
+
+    def _on_scale(self, key, value):
+        self._update_value_label(key)
+        try:
+            self._on_change(key, float(value))
+        except Exception:
+            pass
+
+    def _update_value_label(self, key):
+        db = int(self._scales[key].get())
+        self._value_labels[key].configure(text="%+d dB" % db if db else "0 dB")
+
+    def _reset_band(self, key):
+        self._scales[key].set(0)
+        return "break"
+
+    def reset_all(self):
+        for key in self._scales:
+            self._scales[key].set(0)
+
+    def close(self):
+        if self._on_close:
+            self._on_close()
+        self.destroy()
+
+    def apply_theme(self, theme):
+        self.theme = theme
+        t = theme
+        self.configure(bg=t["bg"])
+        for w in (self._chassis, self._button_row, self._well, *self._columns):
+            w.configure(bg=t["bg"])
+        self._well.configure(bg=t["entry_bg"])
+        for column in self._columns:
+            column.configure(bg=t["entry_bg"])
+        self._title_label.configure(bg=t["bg"], fg=t["title_fg"])
+        self._hint_label.configure(bg=t["bg"], fg=t["search_placeholder_fg"])
+        for key in self._scales:
+            self._value_labels[key].configure(bg=t["entry_bg"], fg=t["title_fg"])
+            self._name_labels[key].configure(bg=t["entry_bg"], fg=t["fg"])
+            self._scales[key].configure(
+                bg=t["bg"], fg=t["fg"], troughcolor=t["scale_trough"],
+                activebackground=t["btn_active_bg"])
+        for btn in (self._reset_btn, self._close_btn):
+            btn.configure(bg=t["btn_bg"], fg=t["btn_fg"],
+                          activebackground=t["btn_active_bg"],
+                          activeforeground=t["btn_active_fg"])
 
 
 # --------------------------------------------------------------------------
@@ -2423,6 +2798,21 @@ class AudioEngine:
     def set_volume(self, percent):
         self._player.audio_set_volume(max(0, min(100, int(percent))))
 
+    # VLC's equalizer has ten fixed bands (31 Hz .. 16 kHz); bass / mid /
+    # treble each drive a group of them.
+    _EQ_BANDS = {"bass": (0, 1, 2), "mid": (3, 4, 5, 6), "treble": (7, 8, 9)}
+
+    def set_eq(self, band, db):
+        if not hasattr(self, "_eq_gains"):
+            self._eq_gains = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
+        self._eq_gains[band] = float(db)
+        eq = vlc.AudioEqualizer()
+        for name, indices in self._EQ_BANDS.items():
+            for i in indices:
+                eq.set_amp_at_index(self._eq_gains[name], i)
+        self._eq = eq  # keep alive while the player uses it
+        self._player.set_equalizer(eq)
+
     def seek_seconds(self, seconds):
         self._player.set_time(max(0, int(seconds * 1000)))
 
@@ -2483,6 +2873,11 @@ class NativeAudioEngine:
 
     def set_volume(self, percent):
         self._engine.set_volume(max(0, min(100, int(percent))) / 100.0)
+
+    def set_eq(self, band, db):
+        """band is "bass", "mid" or "treble"; db is -12..+12. The C++
+        engine ramps to the new gain on its audio thread."""
+        getattr(self._engine, "set_" + band)(float(db))
 
     def seek_seconds(self, seconds):
         self._engine.seek_ms(max(0.0, seconds * 1000.0))
@@ -2856,12 +3251,27 @@ class WaveStackApp(tk.Tk):
 
     def _build_menu(self):
         t = self.theme
-        self.menubar = tk.Menu(self, bg=t["menu_bg"], fg=t["menu_fg"],
+        # A Frame of Menubuttons instead of a native tk.Menu menubar: a native
+        # one cannot hold widgets, and the animated theme icon lives at the
+        # right end of this row.
+        self.menubar = tk.Frame(self, bg=t["menu_bg"], bd=1, relief=tk.RAISED)
+        self.menubar.pack(side=tk.TOP, fill=tk.X)
+        self._menubuttons = {}
+
+        def make_menubutton(label):
+            mb = tk.Menubutton(self.menubar, text=label, font=self.font_normal,
+                               bg=t["menu_bg"], fg=t["menu_fg"],
                                activebackground=t["menu_active_bg"],
                                activeforeground=t["menu_active_fg"],
-                               font=self.font_normal, tearoff=0)
+                               bd=0, padx=8, pady=3, relief=tk.FLAT)
+            mb.pack(side=tk.LEFT)
+            self._menubuttons[label] = mb
+            return mb
 
-        self.file_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+        self.theme_icon = ThemeIcon(self.menubar, self.current_theme_name, t)
+        self.theme_icon.pack(side=tk.RIGHT, padx=(2, 6), pady=2)
+
+        self.file_menu = tk.Menu(make_menubutton("File"), tearoff=0, bg=t["menu_bg"],
                                  fg=t["menu_fg"],
                                  activebackground=t["menu_active_bg"],
                                  activeforeground=t["menu_active_fg"],
@@ -2878,9 +3288,9 @@ class WaveStackApp(tk.Tk):
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.on_close,
                                accelerator="Ctrl+Q")
-        self.menubar.add_cascade(label="File", menu=self.file_menu)
+        self._menubuttons["File"].configure(menu=self.file_menu)
 
-        self.playback_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+        self.playback_menu = tk.Menu(make_menubutton("Playback"), tearoff=0, bg=t["menu_bg"],
                                      fg=t["menu_fg"],
                                      activebackground=t["menu_active_bg"],
                                      activeforeground=t["menu_active_fg"],
@@ -2899,9 +3309,9 @@ class WaveStackApp(tk.Tk):
         playback_menu.add_separator()
         playback_menu.add_command(label="Cycle Playback Mode",
                                    command=self.cycle_playback_mode)
-        self.menubar.add_cascade(label="Playback", menu=playback_menu)
+        self._menubuttons["Playback"].configure(menu=self.playback_menu)
 
-        self.theme_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+        self.theme_menu = tk.Menu(make_menubutton("Theme"), tearoff=0, bg=t["menu_bg"],
                                   fg=t["menu_fg"],
                                   activebackground=t["menu_active_bg"],
                                   activeforeground=t["menu_active_fg"],
@@ -2909,9 +3319,9 @@ class WaveStackApp(tk.Tk):
         for key, label in THEME_LABELS.items():
             self.theme_menu.add_command(
                 label=label, command=lambda k=key: self.set_theme(k))
-        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
+        self._menubuttons["Theme"].configure(menu=self.theme_menu)
 
-        self.help_menu = tk.Menu(self.menubar, tearoff=0, bg=t["menu_bg"],
+        self.help_menu = tk.Menu(make_menubutton("Help"), tearoff=0, bg=t["menu_bg"],
                                  fg=t["menu_fg"],
                                  activebackground=t["menu_active_bg"],
                                  activeforeground=t["menu_active_fg"],
@@ -2921,9 +3331,7 @@ class WaveStackApp(tk.Tk):
         self.help_menu.add_separator()
         self.help_menu.add_command(label="About WaveStack...",
                                command=self.show_about)
-        self.menubar.add_cascade(label="Help", menu=self.help_menu)
-
-        self.config(menu=self.menubar)
+        self._menubuttons["Help"].configure(menu=self.help_menu)
 
     def _bind_shortcuts(self):
         self.bind_all("<Control-o>", lambda e: self.on_open_folder())
@@ -3013,6 +3421,12 @@ class WaveStackApp(tk.Tk):
         self.visualizer_btn = make_button(self.transport_frame, "Audio Visualizer",
                                           self.toggle_visualizer)
         self.visualizer_btn.pack(side=tk.LEFT, padx=(10, 3), pady=3)
+
+        self.eq_gains = {"bass": 0.0, "mid": 0.0, "treble": 0.0}
+        self.eq_window = None
+        self.eq_btn = make_button(self.transport_frame, "Equalizer",
+                                  self.toggle_equalizer)
+        self.eq_btn.pack(side=tk.LEFT, padx=3, pady=3)
 
         self.mode_btn = tk.Button(self.transport_frame,
                                   text=MODE_LABELS[self.playback_mode],
@@ -3280,6 +3694,30 @@ class WaveStackApp(tk.Tk):
             self.toggle_visualizer()
             return "break"
 
+    def toggle_equalizer(self):
+        if self.eq_window is not None:
+            self.eq_window.close()
+            return
+        self.eq_window = EqualizerWindow(
+            self, self.theme, self.eq_gains,
+            on_change=self.on_eq_changed, on_close=self._on_eq_closed)
+        self.eq_btn.config(relief=tk.SUNKEN)
+
+    def _on_eq_closed(self):
+        self.eq_window = None
+        self.eq_btn.config(relief=tk.RAISED)
+        self.save_state()
+
+    def on_eq_changed(self, band, db):
+        self.eq_gains[band] = db
+        self._apply_eq_gain(band, db)
+
+    def _apply_eq_gain(self, band, db):
+        try:
+            self.audio.set_eq(band, db)
+        except Exception:
+            pass
+
     def toggle_theme(self):
         names = list(THEMES.keys())
         new_theme = names[(names.index(self.current_theme_name) + 1) % len(names)]
@@ -3302,8 +3740,13 @@ class WaveStackApp(tk.Tk):
         self.configure(bg=t["bg"])
 
         # Menus
-        for m in (getattr(self, "menubar", None),
-                  getattr(self, "file_menu", None),
+        if hasattr(self, "menubar"):
+            self.menubar.configure(bg=t["menu_bg"])
+            for mb in self._menubuttons.values():
+                mb.configure(bg=t["menu_bg"], fg=t["menu_fg"],
+                             activebackground=t["menu_active_bg"],
+                             activeforeground=t["menu_active_fg"])
+        for m in (getattr(self, "file_menu", None),
                   getattr(self, "playback_menu", None),
                   getattr(self, "theme_menu", None),
                   getattr(self, "help_menu", None)):
@@ -3324,6 +3767,9 @@ class WaveStackApp(tk.Tk):
             self.title_label.configure(bg=t["bg"], fg=t["title_fg"])
         if hasattr(self, "subtitle_label"):
             self.subtitle_label.configure(bg=t["bg"], fg=t["fg"])
+
+        if hasattr(self, "theme_icon"):
+            self.theme_icon.set_theme(theme_name, t)
 
         # Theme toggle button
         if hasattr(self, "theme_btn"):
@@ -3348,6 +3794,7 @@ class WaveStackApp(tk.Tk):
                     getattr(self, "stop_btn", None),
                     getattr(self, "next_btn", None),
                     getattr(self, "visualizer_btn", None),
+                    getattr(self, "eq_btn", None),
                     getattr(self, "mode_btn", None)):
             if btn:
                 btn.configure(
@@ -3443,6 +3890,10 @@ class WaveStackApp(tk.Tk):
         # Visualizer widget
         if hasattr(self, "visualizer"):
             self.visualizer.apply_theme(t)
+
+        # Equalizer window (if open)
+        if getattr(self, "eq_window", None) is not None:
+            self.eq_window.apply_theme(t)
 
         # Queue
         if hasattr(self, "right_col"):
@@ -4114,6 +4565,12 @@ class WaveStackApp(tk.Tk):
             else:
                 self.vinyl.stop_and_reset()
 
+        if hasattr(self, "theme_icon"):
+            if is_playing:
+                self.theme_icon.start_animating()
+            else:
+                self.theme_icon.stop_and_reset()
+
         if hasattr(self, "visualizer"):
             if is_playing:
                 self.visualizer.start_animating()
@@ -4688,6 +5145,7 @@ class WaveStackApp(tk.Tk):
                 "position_seconds": (
                     self.audio.get_time_seconds() if self.now_playing
                     else 0.0),
+                "eq": dict(getattr(self, "eq_gains", {})),
                 "theme": getattr(self, "current_theme_name", DEFAULT_THEME),
                 "accent": getattr(self, "accent_name", DEFAULT_ACCENT),
             }
@@ -4735,6 +5193,14 @@ class WaveStackApp(tk.Tk):
             self.volume_scale.set(vol)
             self.audio.set_volume(vol)
 
+        eq = state.get("eq")
+        if isinstance(eq, dict):
+            for band in self.eq_gains:
+                v = eq.get(band)
+                if isinstance(v, (int, float)):
+                    self.eq_gains[band] = float(max(-12, min(12, v)))
+                    self._apply_eq_gain(band, self.eq_gains[band])
+
         song_path = state.get("last_song")
         if not (isinstance(song_path, str) and os.path.isfile(song_path)):
             return
@@ -4760,6 +5226,14 @@ class WaveStackApp(tk.Tk):
             self.vinyl.shutdown()
         if hasattr(self, "visualizer"):
             self.visualizer.shutdown()
+        if hasattr(self, "theme_icon"):
+            self.theme_icon.shutdown()
+        if getattr(self, "eq_window", None) is not None:
+            try:
+                self.eq_window.destroy()
+            except Exception:
+                pass
+            self.eq_window = None
         for name in ("elapsed_label", "total_label"):
             if hasattr(self, name):
                 getattr(self, name).shutdown()

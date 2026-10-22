@@ -12,6 +12,12 @@
 //    the callback's raw-pointer reads safe. Python arrays returned by
 //    get_audio_buffer() hold a shared_ptr to the buffer, so they stay valid even
 //    after a later load_file().
+//  * The equalizer is a miniaudio node graph: buffer reader -> low shelf (bass)
+//    -> peaking (mid) -> high shelf (treble) -> endpoint. The device callback
+//    pulls the graph, then applies volume. Python only stores target gains in
+//    atomics; the audio thread itself ramps the live gains toward them (1 dB per
+//    callback) and re-derives the biquad coefficients, so no lock is shared with
+//    the callback and a dragged slider never steps the filter (no zipper pops).
 
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_NO_ENCODING
@@ -40,7 +46,24 @@ namespace {
 constexpr ma_uint32 kSampleRate = 44100;
 constexpr ma_uint32 kChannels = 2;
 
+constexpr double kBassHz = 100.0;
+constexpr double kMidHz = 1000.0;
+constexpr double kTrebleHz = 8000.0;
+constexpr double kShelfSlope = 0.9;
+constexpr double kMidQ = 0.8;
+constexpr float kMaxGainDb = 12.0f;
+constexpr float kGainStepDb = 1.0f;  // max change per device callback (~10 ms)
+
 }  // namespace
+
+class AudioEngine;
+
+// Feeds the decoded buffer into the node graph. Always delivers the full request
+// (zero-padded past the end) so the graph never stalls; the engine tracks the end.
+struct BufferSource {
+    ma_data_source_base base;
+    AudioEngine* engine;
+};
 
 class AudioEngine {
 public:
@@ -58,10 +81,24 @@ public:
         }
         device_ready_ = true;
         init_fft_tables();
+        try {
+            init_graph();
+        } catch (...) {
+            ma_device_uninit(&device_);
+            throw;
+        }
     }
 
     ~AudioEngine() {
         if (device_ready_) ma_device_uninit(&device_);  // stops the device and joins its thread
+        if (graph_ready_) {
+            ma_hishelf_node_uninit(&treble_node_, nullptr);
+            ma_peak_node_uninit(&mid_node_, nullptr);
+            ma_loshelf_node_uninit(&bass_node_, nullptr);
+            ma_data_source_node_uninit(&source_node_, nullptr);
+            ma_data_source_uninit(&source_.base);
+            ma_node_graph_uninit(&graph_, nullptr);
+        }
     }
 
     AudioEngine(const AudioEngine&) = delete;
@@ -153,6 +190,12 @@ public:
 
     // True once playback reached the end of the track on its own; cleared by play/stop/seek/load.
     bool is_finished() const { return finished_.load(); }
+
+    // Equalizer gains in dB (clamped to +/-12). Lock-free: the audio thread picks
+    // the new target up on its next callback and glides to it.
+    void set_bass(float db) { bass_target_.store(clamp_db(db), std::memory_order_relaxed); }
+    void set_mid(float db) { mid_target_.store(clamp_db(db), std::memory_order_relaxed); }
+    void set_treble(float db) { treble_target_.store(clamp_db(db), std::memory_order_relaxed); }
 
     void set_volume(float v) { volume_.store(std::clamp(v, 0.0f, 1.0f)); }
     float get_volume() const { return volume_.load(); }
@@ -257,6 +300,106 @@ public:
 private:
     static constexpr int kFftSize = 2048;
 
+    static float clamp_db(float db) {
+        if (!std::isfinite(db)) return 0.0f;
+        return std::clamp(db, -kMaxGainDb, kMaxGainDb);
+    }
+
+    static const ma_data_source_vtable* source_vtable() {
+        static const ma_data_source_vtable vt = {
+            &AudioEngine::source_read, &AudioEngine::source_seek, &AudioEngine::source_format,
+            nullptr, nullptr, nullptr, 0};
+        return &vt;
+    }
+
+    static ma_result source_read(ma_data_source* ds, void* out, ma_uint64 frame_count, ma_uint64* frames_read) {
+        AudioEngine* self = static_cast<BufferSource*>(ds)->engine;
+        auto* dst = static_cast<float*>(out);
+
+        const float* src = self->data_ptr_.load(std::memory_order_acquire);
+        const uint64_t total = self->frames_.load(std::memory_order_acquire);
+        const uint64_t cur = self->cursor_.load(std::memory_order_acquire);
+        const uint64_t n = std::min<uint64_t>(frame_count, total > cur ? total - cur : 0);
+
+        if (src && n) std::copy(src + cur * kChannels, src + (cur + n) * kChannels, dst);
+        std::fill(dst + n * kChannels, dst + frame_count * kChannels, 0.0f);
+
+        self->cursor_.store(cur + n, std::memory_order_release);
+        if (n < frame_count && src) {
+            self->playing_.store(false, std::memory_order_release);
+            self->finished_.store(true, std::memory_order_release);
+        }
+        if (frames_read) *frames_read = frame_count;
+        return MA_SUCCESS;
+    }
+
+    static ma_result source_seek(ma_data_source*, ma_uint64) { return MA_NOT_IMPLEMENTED; }
+
+    static ma_result source_format(ma_data_source*, ma_format* format, ma_uint32* channels,
+                                   ma_uint32* rate, ma_channel*, size_t) {
+        if (format) *format = ma_format_f32;
+        if (channels) *channels = kChannels;
+        if (rate) *rate = kSampleRate;
+        return MA_SUCCESS;
+    }
+
+    void init_graph() {
+        ma_node_graph_config gcfg = ma_node_graph_config_init(kChannels);
+        if (ma_node_graph_init(&gcfg, nullptr, &graph_) != MA_SUCCESS) {
+            throw std::runtime_error("AudioEngine: could not create the DSP graph");
+        }
+        graph_ready_ = true;
+
+        ma_data_source_config scfg = ma_data_source_config_init();
+        scfg.vtable = source_vtable();
+        source_.engine = this;
+        if (ma_data_source_init(&scfg, &source_.base) != MA_SUCCESS) {
+            throw std::runtime_error("AudioEngine: could not create the buffer source");
+        }
+        ma_data_source_node_config ncfg = ma_data_source_node_config_init(&source_.base);
+        ma_loshelf_node_config bcfg = ma_loshelf_node_config_init(kChannels, kSampleRate, 0.0, kShelfSlope, kBassHz);
+        ma_peak_node_config mcfg = ma_peak_node_config_init(kChannels, kSampleRate, 0.0, kMidQ, kMidHz);
+        ma_hishelf_node_config tcfg = ma_hishelf_node_config_init(kChannels, kSampleRate, 0.0, kShelfSlope, kTrebleHz);
+        bass_cfg_ = bcfg.loshelf;
+        mid_cfg_ = mcfg.peak;
+        treble_cfg_ = tcfg.hishelf;
+
+        if (ma_data_source_node_init(&graph_, &ncfg, nullptr, &source_node_) != MA_SUCCESS ||
+            ma_loshelf_node_init(&graph_, &bcfg, nullptr, &bass_node_) != MA_SUCCESS ||
+            ma_peak_node_init(&graph_, &mcfg, nullptr, &mid_node_) != MA_SUCCESS ||
+            ma_hishelf_node_init(&graph_, &tcfg, nullptr, &treble_node_) != MA_SUCCESS) {
+            throw std::runtime_error("AudioEngine: could not create the equalizer nodes");
+        }
+        ma_node_attach_output_bus(&source_node_, 0, &bass_node_, 0);
+        ma_node_attach_output_bus(&bass_node_, 0, &mid_node_, 0);
+        ma_node_attach_output_bus(&mid_node_, 0, &treble_node_, 0);
+        ma_node_attach_output_bus(&treble_node_, 0, ma_node_graph_get_endpoint(&graph_), 0);
+    }
+
+    // Audio thread only: move a live gain one step toward its target and, if it
+    // moved, recompute that filter's coefficients (history is kept by reinit).
+    static bool glide(float& live, float target) {
+        if (live == target) return false;
+        float d = target - live;
+        live = std::fabs(d) <= kGainStepDb ? target : live + (d > 0 ? kGainStepDb : -kGainStepDb);
+        return true;
+    }
+
+    void update_eq_gains() {
+        if (glide(bass_live_, bass_target_.load(std::memory_order_relaxed))) {
+            bass_cfg_.gainDB = bass_live_;
+            ma_loshelf_node_reinit(&bass_cfg_, &bass_node_);
+        }
+        if (glide(mid_live_, mid_target_.load(std::memory_order_relaxed))) {
+            mid_cfg_.gainDB = mid_live_;
+            ma_peak_node_reinit(&mid_cfg_, &mid_node_);
+        }
+        if (glide(treble_live_, treble_target_.load(std::memory_order_relaxed))) {
+            treble_cfg_.gainDB = treble_live_;
+            ma_hishelf_node_reinit(&treble_cfg_, &treble_node_);
+        }
+    }
+
     void init_fft_tables() {
         window_.resize(kFftSize);
         for (int i = 0; i < kFftSize; ++i) {
@@ -305,33 +448,38 @@ private:
         auto* self = static_cast<AudioEngine*>(dev->pUserData);
         auto* dst = static_cast<float*>(out);
 
-        const float* src = self->data_ptr_.load(std::memory_order_acquire);
-        const uint64_t total = self->frames_.load(std::memory_order_acquire);
-        const uint64_t cur = self->cursor_.load(std::memory_order_acquire);
-        const ma_uint32 n = static_cast<ma_uint32>(std::min<uint64_t>(frame_count, total > cur ? total - cur : 0));
-        const float vol = self->volume_.load(std::memory_order_relaxed);
+        self->playing_.store(true, std::memory_order_release);
+        self->update_eq_gains();
 
-        if (src) {
-            const float* in = src + cur * kChannels;
-            for (ma_uint32 i = 0; i < n * kChannels; ++i) dst[i] = in[i] * vol;
-        }
-        std::fill(dst + static_cast<size_t>(n) * kChannels, dst + static_cast<size_t>(frame_count) * kChannels, 0.0f);
+        ma_uint64 got = 0;
+        ma_node_graph_read_pcm_frames(&self->graph_, dst, frame_count, &got);
+        if (got < frame_count) std::fill(dst + got * kChannels, dst + static_cast<size_t>(frame_count) * kChannels, 0.0f);
+
+        const float vol = self->volume_.load(std::memory_order_relaxed);
+        for (ma_uint32 i = 0; i < frame_count * kChannels; ++i) dst[i] *= vol;
 
         self->latency_frames_.store(
             static_cast<uint64_t>(dev->playback.internalPeriodSizeInFrames) * dev->playback.internalPeriods *
                 kSampleRate / std::max<ma_uint32>(dev->playback.internalSampleRate, 1),
             std::memory_order_relaxed);
-        self->cursor_.store(cur + n, std::memory_order_release);
-        self->playing_.store(true, std::memory_order_release);
-
-        if (n < frame_count && src) {
-            self->playing_.store(false, std::memory_order_release);
-            self->finished_.store(true, std::memory_order_release);
-        }
     }
 
     ma_device device_{};
     bool device_ready_ = false;
+
+    ma_node_graph graph_{};
+    bool graph_ready_ = false;
+    BufferSource source_{};
+    ma_data_source_node source_node_{};
+    ma_loshelf_node bass_node_{};
+    ma_peak_node mid_node_{};
+    ma_hishelf_node treble_node_{};
+    ma_loshelf_config bass_cfg_{};
+    ma_peak_config mid_cfg_{};
+    ma_hishelf_config treble_cfg_{};
+    // Audio-thread-only live gains; the *_target_ atomics are written by Python.
+    float bass_live_ = 0.0f, mid_live_ = 0.0f, treble_live_ = 0.0f;
+    std::atomic<float> bass_target_{0.0f}, mid_target_{0.0f}, treble_target_{0.0f};
 
     mutable std::mutex control_mutex_;  // guards buffer_ and device start/stop, never held in the callback
     std::shared_ptr<std::vector<float>> buffer_;
@@ -403,6 +551,9 @@ PYBIND11_MODULE(wavestack_audio, m) {
         .def("is_finished", &AudioEngine::is_finished)
         .def("set_volume", &AudioEngine::set_volume, py::arg("volume"))
         .def("get_volume", &AudioEngine::get_volume)
+        .def("set_bass", &AudioEngine::set_bass, py::arg("db"))
+        .def("set_mid", &AudioEngine::set_mid, py::arg("db"))
+        .def("set_treble", &AudioEngine::set_treble, py::arg("db"))
         .def_property_readonly("sample_rate", &AudioEngine::sample_rate)
         .def_property_readonly("channels", &AudioEngine::channels)
         .def("get_spectrum", &AudioEngine::get_spectrum, py::arg("bands"))
