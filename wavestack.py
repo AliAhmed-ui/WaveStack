@@ -28,6 +28,8 @@ the window is fully retro-styled.
 import os
 import sys
 import json
+import bisect
+import math
 import re
 import time
 import queue
@@ -60,7 +62,7 @@ except ImportError:
     NATIVE_AUDIO_AVAILABLE = False
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageEnhance, ImageOps, ImageTk
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -81,6 +83,8 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 try:
+    if not sys.platform.startswith("linux"):
+        raise ImportError("MPRIS media keys are Linux-only")
     from dbus_next.aio import MessageBus
     from dbus_next.service import ServiceInterface, method, dbus_property
     from dbus_next import Variant, PropertyAccess
@@ -94,8 +98,8 @@ except ImportError:
 # Configuration
 # --------------------------------------------------------------------------
 
-# Change this if your username or music folder differs.
-DEFAULT_MUSIC_DIR = "/home/syed-ali-ahmed-shah/Music"
+# Change this if your music folder is somewhere else.
+DEFAULT_MUSIC_DIR = os.path.join(os.path.expanduser("~"), "Music")
 
 APP_TITLE = "WaveStack"
 APP_VERSION = "1.0"
@@ -1479,6 +1483,245 @@ def _sync_missing_tracks(directory, missing, known_missing, out, cancel,
 
 
 # --------------------------------------------------------------------------
+# Wallpaper Mode: vibe detection, scene scripts, procedural pixel art
+#
+# Everything here is plain functions with no Tk access. Art lives in
+# assets/visuals/<vibe>/image_NN.png next to this file; any folder that is
+# missing or empty is filled with scenes painted by wavestack_art.py
+# (seeded, so the output is deterministic), so the feature works with no
+# downloads. The painter lives in its own module because it is large and
+# only needed when art is missing.
+# Drop your own PNGs into a vibe folder and they replace the generated ones.
+# --------------------------------------------------------------------------
+
+VISUALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "assets", "visuals")
+VISUAL_ART_SIZE = (320, 180)       # painted small, upscaled with NEAREST
+VISUAL_SCENES_PER_VIBE = 12
+VISUAL_CONTRAST = 1.12             # ImageEnhance.Contrast factor ("color" style)
+# "Grime" style: grayscale, crushed contrast, whites remapped to one
+# aggressive colour, rebuilt from a GRIME_LOW_RES_WIDTH-wide pixel grid.
+GRIME_COLOR = "#FF0000"
+GRIME_CONTRAST = 3.0
+GRIME_LOW_RES_WIDTH = 256          # 256x144 on a 16:9 screen
+VISUAL_LOOP_MS = 8000              # frame length when there is no script
+WALLPAPER_POLL_MS = 15
+
+VIBE_DEFAULT = "default"
+VIBE_FOR_GENRE = {
+    GENRE_HIPHOP: "industrial_grunge",
+    GENRE_ROCK: "industrial_grunge",
+    GENRE_ELECTRONIC: "cyber_neon",
+    GENRE_POP: "cyber_neon",
+    GENRE_RNB: "midnight_dusk",
+    GENRE_ACOUSTIC: "midnight_dusk",
+}
+VISUAL_VIBES = ("cyber_neon", "industrial_grunge", "midnight_dusk",
+                VIBE_DEFAULT)
+
+_WALLPAPER_FONT_PREFERENCE = ["VT323", "VCR OSD Mono", "Fixedsys",
+                              "Perfect DOS VGA 437", "Terminal"]
+
+def get_song_visual_vibe(song_path, genre=None):
+    """Pick a vibe folder name for *song_path*. *genre* (an already
+    classified genre such as the AUTO-SORT cache holds) wins; otherwise
+    the file's own ID3 TCON tag is normalised; anything unrecognised
+    gets the default vibe."""
+    if genre is None or genre not in VIBE_FOR_GENRE:
+        raw, _artists = read_track_tags(song_path)
+        genre = normalize_genre(raw) if raw else genre
+    return VIBE_FOR_GENRE.get(genre, VIBE_DEFAULT)
+
+
+def _vibe_dir(vibe):
+    return os.path.join(VISUALS_DIR, vibe)
+
+
+def _list_vibe_files(vibe):
+    try:
+        names = os.listdir(_vibe_dir(vibe))
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")))
+
+
+def generate_vibe_scene(vibe, index):
+    """Paint scene *index* (0-based) of *vibe* with wavestack_art (numpy +
+    Pillow, deterministic). Returns a plain black frame if the painter
+    can't be imported, so Wallpaper Mode still shows the lyrics."""
+    try:
+        import wavestack_art
+        return wavestack_art.generate_scene(vibe, index)
+    except Exception:
+        return Image.new("RGB", VISUAL_ART_SIZE, (0, 0, 0))
+
+
+def generate_visual_assets(force=False):
+    """Write the generated scenes to assets/visuals/<vibe>/image_NN.png.
+    Vibes that already hold images are left alone unless *force*.
+    Returns the number of files written; never raises."""
+    written = 0
+    for vibe in VISUAL_VIBES:
+        if _list_vibe_files(vibe) and not force:
+            continue
+        try:
+            os.makedirs(_vibe_dir(vibe), exist_ok=True)
+            for n in range(VISUAL_SCENES_PER_VIBE):
+                generate_vibe_scene(vibe, n).save(
+                    os.path.join(_vibe_dir(vibe), f"image_{n + 1:02d}.png"))
+                written += 1
+        except Exception:
+            continue
+    return written
+
+
+def load_vibe_sources(vibe):
+    """Images for *vibe* as a list of file paths. A missing/empty folder
+    is filled by generating the art first; if even that fails (read-only
+    install) in-memory PIL images are returned instead. Falls back to
+    the default vibe, and never returns an empty list."""
+    for candidate in (vibe, VIBE_DEFAULT):
+        files = _list_vibe_files(candidate)
+        if not files:
+            try:
+                os.makedirs(_vibe_dir(candidate), exist_ok=True)
+                for n in range(VISUAL_SCENES_PER_VIBE):
+                    generate_vibe_scene(candidate, n).save(os.path.join(
+                        _vibe_dir(candidate), f"image_{n + 1:02d}.png"))
+                files = _list_vibe_files(candidate)
+            except Exception:
+                files = []
+        if files:
+            return [os.path.join(_vibe_dir(candidate), f) for f in files]
+    return [generate_vibe_scene(VIBE_DEFAULT, n)
+            for n in range(VISUAL_SCENES_PER_VIBE)]
+
+
+def grime_process(src, screen_size, color=GRIME_COLOR,
+                  low_res_width=GRIME_LOW_RES_WIDTH):
+    """Turn any image into the gritty two-tone pixel look and return a
+    PIL image of exactly *screen_size*. *src* is a path or PIL image.
+
+    Grayscale strips the colour grading; a heavy contrast boost crushes
+    the midtones to near black/white; colorize maps black -> #000000 and
+    white -> *color*. The image is then rebuilt from a coarse grid
+    (low_res_width wide, screen aspect) and blown back up, both steps
+    strictly NEAREST so the pixels stay hard-edged. The source is first
+    cropped (not resampled) to the screen's aspect so nothing stretches."""
+    w, h = screen_size
+    img = Image.open(src) if isinstance(src, str) else src
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(GRIME_CONTRAST)
+    img = ImageOps.colorize(img, black="#000000", white=color)
+    target = w / h
+    if img.width / img.height > target:
+        cw = round(img.height * target)
+        box = ((img.width - cw) // 2, 0, (img.width - cw) // 2 + cw, img.height)
+    else:
+        ch = round(img.width / target)
+        box = (0, (img.height - ch) // 2, img.width, (img.height - ch) // 2 + ch)
+    img = img.crop(box)
+    low = (low_res_width, max(1, round(low_res_width / target)))
+    img = img.resize(low, Image.Resampling.NEAREST)
+    return img.resize((w, h), Image.Resampling.NEAREST)
+
+
+def grime_photo(src, screen_size, color=GRIME_COLOR):
+    """grime_process() wrapped as an ImageTk.PhotoImage. Must be called
+    on the Tk thread; the caller has to keep a reference to it."""
+    return ImageTk.PhotoImage(grime_process(src, screen_size, color))
+
+
+def load_visual_script(song_path, image_count, vibe_dir_files=()):
+    """Return (verses, vibe_override). Each verse is a dict with
+    start_ms, end_ms, text and image (a 0-based index into the vibe's
+    images, or an absolute path to any image file).
+
+    Looks for <track>.visuals.json first, in one of three shapes:
+      * a list of {start_ms, end_ms, text, image}
+      * {"vibe": ..., "verses": [that list]}
+      * a plain timestamp map {"<ms>": {"image": ..., "text": ...}} (or
+        "<ms>": [image, text]); each verse ends where the next begins
+    image is a 1-based number (1 = image_01.png), a file in the vibe
+    folder, or a path to any image (relative to the track). Failing
+    that, a sibling .lrc supplies the text and every lyric line gets the
+    next picture, in an order shuffled per song (so tracks sharing a vibe
+    don't all open on image_01) that never repeats back to back. Returns ([], None)
+    if there is neither, and the window runs its default loop."""
+    base = os.path.splitext(song_path)[0]
+    count = max(1, image_count)
+
+    song_dir = os.path.dirname(song_path)
+
+    def resolve(ref, fallback):
+        if isinstance(ref, str) and ref not in vibe_dir_files:
+            path = os.path.join(song_dir, os.path.expanduser(ref))
+            if os.path.isfile(path):
+                return os.path.abspath(path)
+        if isinstance(ref, int):
+            return (ref - 1) % count
+        if isinstance(ref, str):
+            if ref in vibe_dir_files:
+                return list(vibe_dir_files).index(ref)
+            m = re.search(r"(\d+)", ref)
+            if m:
+                return (int(m.group(1)) - 1) % count
+        return fallback % count
+
+    json_path = base + ".visuals.json"
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            override = None
+            if isinstance(data, dict) and "verses" not in data:
+                # timestamp map: {"12000": {"image", "text"} | [image, text]}
+                entries = []
+                for key, value in data.items():
+                    if not str(key).strip().isdigit():
+                        continue
+                    if isinstance(value, (list, tuple)):
+                        value = {"image": value[0] if value else None,
+                                 "text": value[1] if len(value) > 1 else ""}
+                    entries.append(dict(value, start_ms=int(key)))
+                data = {"vibe": data.get("vibe"), "verses": entries}
+            if isinstance(data, dict):
+                override = data.get("vibe")
+                data = data.get("verses", [])
+            verses = []
+            for n, entry in enumerate(data):
+                start = int(entry["start_ms"])
+                verses.append({"start_ms": start,
+                               "end_ms": int(entry.get("end_ms", -1)),
+                               "text": str(entry.get("text", "")),
+                               "image": resolve(entry.get("image"), n)})
+            verses.sort(key=lambda v: v["start_ms"])
+            for n, v in enumerate(verses):
+                if v["end_ms"] <= v["start_ms"]:
+                    v["end_ms"] = (verses[n + 1]["start_ms"]
+                                   if n + 1 < len(verses)
+                                   else v["start_ms"] + 5000)
+            if verses:
+                return verses, override
+        except Exception:
+            pass  # malformed sidecar: fall through to the .lrc
+
+    lines = parse_lrc(base + ".lrc")
+    order = list(range(count))
+    random.Random(os.path.basename(song_path)).shuffle(order)
+    verses = []
+    for n, (start, text) in enumerate(lines):
+        end = lines[n + 1][0] if n + 1 < len(lines) else start + 5000
+        if not text:
+            continue  # instrumental gap: keep the last picture up
+        verses.append({"start_ms": start, "end_ms": end, "text": text,
+                       "image": order[len(verses) % count]})
+    return verses, None
+
+
+
+# --------------------------------------------------------------------------
 # Retro dialog box (replaces tkinter.messagebox so error/info popups
 # match the rest of the UI instead of looking like a modern GTK dialog)
 # --------------------------------------------------------------------------
@@ -2430,6 +2673,244 @@ class EqualizerWindow(tk.Toplevel):
             btn.configure(bg=t["btn_bg"], fg=t["btn_fg"],
                           activebackground=t["btn_active_bg"],
                           activeforeground=t["btn_active_fg"])
+
+
+# --------------------------------------------------------------------------
+# Wallpaper Mode window
+# --------------------------------------------------------------------------
+
+class WallpaperWindow(tk.Toplevel):
+    """Fullscreen, canvas-only pixel-art backdrop with the current verse
+    drawn over it. A 15 ms `after` loop reads the playback position and
+    only repaints when the verse changes; frames swap instantly (no
+    fades). Two looks, toggled with G: "color" (default; the art's own
+    palette, lightly contrast-boosted) and "grime" (grime_process,
+    two-tone red/black). Both scale with NEAREST only so pixels stay chunky. Fixed
+    colours -- a "hardware" display, not themed. Esc closes."""
+
+    STYLES = ("color", "grime")
+
+    _CACHE_LIMIT = 8
+
+    def __init__(self, parent, get_position_ms, genre_of, on_close=None):
+        super().__init__(parent)
+        self._get_position_ms = get_position_ms
+        self._genre_of = genre_of
+        self._on_close = on_close
+        self._after_id = None
+        self._sources = []
+        self._source_names = []
+        self._verses = []
+        self._starts = []
+        self._state = None
+        self._photos = collections.OrderedDict()   # (style, image) -> PhotoImage
+        self._style = self.STYLES[0]
+        self._size = (0, 0)
+        self._bg_item = None
+        self._font = None
+        self._font_px = 0
+        self._track = None
+
+        self.title("WaveStack Wallpaper")
+        self.configure(bg="black")
+        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0, bd=0,
+                                cursor="none")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.attributes("-fullscreen", True)
+        for widget in (self, self.canvas):
+            widget.bind("<Escape>", lambda e: (self.close(), "break")[1])
+            widget.bind("<KeyPress-g>", self._on_toggle_style)
+            widget.bind("<KeyPress-G>", self._on_toggle_style)
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after_idle(self.canvas.focus_force)
+        self._family = self._pick_family()
+
+    def _pick_family(self):
+        try:
+            available = set(tkfont.families(self))
+        except tk.TclError:
+            available = set()
+        for name in _WALLPAPER_FONT_PREFERENCE:
+            if name in available:
+                return name
+        return get_retro_font(self, 9, bold=True)[0]
+
+    def _on_toggle_style(self, event=None):
+        i = self.STYLES.index(self._style)
+        self._style = self.STYLES[(i + 1) % len(self.STYLES)]
+        self._state = None
+        self._render(force=True)
+        return "break"
+
+    # -- track / asset loading -----------------------------------------
+
+    def load_track(self, path):
+        """(Re)build the verse script for *path*. Cheap; called by the app
+        on every track start while this window is open."""
+        self._track = path
+        vibe = VIBE_DEFAULT
+        if path:
+            try:
+                vibe = get_song_visual_vibe(path, self._genre_of(path))
+            except Exception:
+                pass
+        self._sources = load_vibe_sources(vibe)
+        self._source_names = [os.path.basename(s) if isinstance(s, str) else ""
+                              for s in self._sources]
+        verses, override = ([], None)
+        if path:
+            verses, override = load_visual_script(
+                path, len(self._sources), self._source_names)
+        if override in VISUAL_VIBES and override != vibe:
+            self._sources = load_vibe_sources(override)
+            self._source_names = [os.path.basename(s) if isinstance(s, str)
+                                  else "" for s in self._sources]
+            verses, _ = load_visual_script(path, len(self._sources),
+                                           self._source_names)
+        self._verses = verses
+        self._starts = [v["start_ms"] for v in verses]
+        self._photos.clear()
+        self._state = None
+        self._render(force=True)
+
+    # -- rendering -----------------------------------------------------
+
+    def _on_configure(self, event):
+        if (event.width, event.height) != self._size and event.width > 1:
+            self._size = (event.width, event.height)
+            self._photos.clear()
+            self._font = None
+            self._state = None
+            if self._after_id is None:
+                self._poll()
+
+    def _photo_for(self, image):
+        key = (self._style, image)
+        photo = self._photos.get(key)
+        if photo is not None:
+            self._photos.move_to_end(key)
+            return photo
+        w, h = self._size
+        src = (image if isinstance(image, str)
+               else self._sources[image % len(self._sources)])
+        try:
+            if self._style == "grime":
+                img = grime_process(src, (w, h))
+            else:
+                img = (Image.open(src) if isinstance(src, str) else src).convert("RGB")
+                img = ImageEnhance.Contrast(img).enhance(VISUAL_CONTRAST)
+                # Cover-fit without distortion: scale uniformly with
+                # NEAREST, then crop the overflow around the centre.
+                scale = max(w / img.width, h / img.height)
+                sw = max(w, round(img.width * scale))
+                sh = max(h, round(img.height * scale))
+                img = img.resize((sw, sh), Image.Resampling.NEAREST)
+                ox, oy = (sw - w) // 2, (sh - h) // 2
+                img = img.crop((ox, oy, ox + w, oy + h))
+        except Exception:
+            img = Image.new("RGB", (w, h), (0, 0, 0))
+        photo = ImageTk.PhotoImage(img)
+        self._photos[key] = photo
+        while len(self._photos) > self._CACHE_LIMIT:
+            self._photos.popitem(last=False)
+        return photo
+
+    def _wrap(self, text, font, max_width):
+        lines = []
+        for para in text.splitlines() or [""]:
+            line = ""
+            for word in para.split():
+                trial = f"{line} {word}".strip()
+                if line and font.measure(trial) > max_width:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = trial
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _draw_text(self, text):
+        self.canvas.delete("verse")
+        if not text:
+            return
+        w, h = self._size
+        px = max(20, h // 13)
+        if self._font is None or self._font_px != px:
+            self._font = tkfont.Font(family=self._family, size=-px, weight="bold")
+            self._font_px = px
+        wrapped = self._wrap(text, self._font, int(w * 0.8))
+        # Shrink very long verses until the block fits the lower 45%.
+        while (self._font.metrics("linespace") * (wrapped.count("\n") + 1) > h * 0.45
+               and self._font_px > 14):
+            self._font_px = int(self._font_px * 0.9)
+            self._font = tkfont.Font(family=self._family, size=-self._font_px,
+                                     weight="bold")
+            wrapped = self._wrap(text, self._font, int(w * 0.8))
+        cx, cy = w // 2, int(h * 0.78)
+        d = max(3, self._font_px // 10)
+        for dx, dy in ((d, d), (d, 0), (0, d), (d, d // 2), (d // 2, d)):
+            self.canvas.create_text(cx + dx, cy + dy, text=wrapped, fill="black",
+                                    font=self._font, justify=tk.CENTER,
+                                    tags="verse")
+        self.canvas.create_text(cx, cy, text=wrapped, fill="white",
+                                font=self._font, justify=tk.CENTER, tags="verse")
+
+    def _current(self, pos_ms):
+        """(image index, text) for a playback position."""
+        if not self._verses:
+            return (pos_ms // VISUAL_LOOP_MS) % max(1, len(self._sources)), ""
+        i = bisect.bisect_right(self._starts, pos_ms) - 1
+        if i < 0:
+            return self._verses[0]["image"], ""
+        v = self._verses[i]
+        return v["image"], (v["text"] if pos_ms < v["end_ms"] else "")
+
+    def _render(self, force=False):
+        if self._size[0] <= 1 or not self._sources:
+            return
+        try:
+            pos = int(self._get_position_ms())
+        except Exception:
+            pos = 0
+        state = self._current(max(0, pos))
+        if state == self._state and not force:
+            return
+        image_changed = self._state is None or state[0] != self._state[0]
+        self._state = state
+        if image_changed or self._bg_item is None:
+            photo = self._photo_for(state[0])
+            if self._bg_item is None:
+                self._bg_item = self.canvas.create_image(0, 0, anchor="nw",
+                                                         image=photo)
+            else:
+                self.canvas.itemconfig(self._bg_item, image=photo)
+            self.canvas.tag_lower(self._bg_item)
+        self._draw_text(state[1])
+
+    def _poll(self):
+        self._after_id = None
+        try:
+            self._render()
+        finally:
+            try:
+                self._after_id = self.after(WALLPAPER_POLL_MS, self._poll)
+            except tk.TclError:
+                self._after_id = None
+
+    def shutdown(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def close(self):
+        self.shutdown()
+        if self._on_close:
+            self._on_close()
+        self.destroy()
 
 
 # --------------------------------------------------------------------------
@@ -3428,6 +3909,11 @@ class WaveStackApp(tk.Tk):
                                   self.toggle_equalizer)
         self.eq_btn.pack(side=tk.LEFT, padx=3, pady=3)
 
+        self.wallpaper_window = None
+        self.wallpaper_btn = make_button(self.transport_frame, "Wallpaper",
+                                         self.toggle_wallpaper)
+        self.wallpaper_btn.pack(side=tk.LEFT, padx=3, pady=3)
+
         self.mode_btn = tk.Button(self.transport_frame,
                                   text=MODE_LABELS[self.playback_mode],
                                   command=self.cycle_playback_mode,
@@ -3718,6 +4204,27 @@ class WaveStackApp(tk.Tk):
         except Exception:
             pass
 
+    def toggle_wallpaper(self):
+        if self.wallpaper_window is not None:
+            self.wallpaper_window.close()
+            return
+        if not PIL_AVAILABLE:
+            self.show_retro_error("Wallpaper Mode",
+                                  "Wallpaper Mode needs Pillow.\n\n"
+                                  "pip install -r requirements.txt")
+            return
+        self.wallpaper_window = WallpaperWindow(
+            self,
+            get_position_ms=lambda: self.audio.get_time_seconds() * 1000.0,
+            genre_of=lambda p: self._genre_of(p),
+            on_close=self._on_wallpaper_closed)
+        self.wallpaper_btn.config(relief=tk.SUNKEN)
+        self.wallpaper_window.load_track(self.now_playing)
+
+    def _on_wallpaper_closed(self):
+        self.wallpaper_window = None
+        self.wallpaper_btn.config(relief=tk.RAISED)
+
     def toggle_theme(self):
         names = list(THEMES.keys())
         new_theme = names[(names.index(self.current_theme_name) + 1) % len(names)]
@@ -3795,6 +4302,7 @@ class WaveStackApp(tk.Tk):
                     getattr(self, "next_btn", None),
                     getattr(self, "visualizer_btn", None),
                     getattr(self, "eq_btn", None),
+                    getattr(self, "wallpaper_btn", None),
                     getattr(self, "mode_btn", None)):
             if btn:
                 btn.configure(
@@ -4752,6 +5260,8 @@ class WaveStackApp(tk.Tk):
             self.vinyl.load_track(path)  # extracts/caches art once per track
         if hasattr(self, "lyrics_display"):
             self.lyrics_display.load_track(path)  # finds & parses .lrc once per track
+        if getattr(self, "wallpaper_window", None) is not None:
+            self.wallpaper_window.load_track(path)
         self._sync_vinyl_spin_state()
 
         if resume_position and resume_position > 0:
@@ -5228,6 +5738,13 @@ class WaveStackApp(tk.Tk):
             self.visualizer.shutdown()
         if hasattr(self, "theme_icon"):
             self.theme_icon.shutdown()
+        if getattr(self, "wallpaper_window", None) is not None:
+            try:
+                self.wallpaper_window.shutdown()
+                self.wallpaper_window.destroy()
+            except Exception:
+                pass
+            self.wallpaper_window = None
         if getattr(self, "eq_window", None) is not None:
             try:
                 self.eq_window.destroy()
@@ -5263,10 +5780,17 @@ def _fatal_startup_error(message):
 
 def main():
     global vlc
+    # pythonw.exe (the windowless Windows launcher) has no stdio at all;
+    # give the print/traceback paths somewhere harmless to write.
+    for _name in ("stdout", "stderr"):
+        if getattr(sys, _name) is None:
+            setattr(sys, _name, open(os.devnull, "w"))
     if NATIVE_AUDIO_AVAILABLE:
         pass  # libVLC is only needed if the native engine can't open a device
     elif vlc is None:
-        venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
+        venv_bin = "Scripts" if sys.platform == "win32" else "bin"
+        venv_exe = "python.exe" if sys.platform == "win32" else "python3"
+        venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", venv_bin, venv_exe)
         if os.path.isfile(venv_python) and sys.executable != venv_python:
             os.execv(venv_python, [venv_python] + sys.argv)
         _fatal_startup_error(
@@ -5285,8 +5809,10 @@ def main():
             _fatal_startup_error(
                 "WaveStack could not start because the VLC engine is "
                 "missing or broken.\n\nInstall it with:\n"
-                "  sudo apt install vlc\n\n"
-                f"Details: {exc}")
+                + ("  Install VLC (64-bit) from videolan.org\n\n"
+                   if sys.platform == "win32"
+                   else "  sudo apt install vlc\n\n")
+                + f"Details: {exc}")
             sys.exit(1)
 
     try:

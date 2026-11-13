@@ -5,6 +5,7 @@ A 1990s-styled, offline-first MP3 player for Linux desktops. Python 3 + classic 
 ## Commands
 
 ```bash
+run.bat                                    # Windows one-click: winget-installs Python 3.12 + VLC, makes venv\, Desktop shortcut, launches via pythonw (CRLF endings required)
 ./run.sh                                   # normal launch; first run installs system deps with sudo, creates venv/, writes launchers
 ./venv/bin/python3 wavestack.py            # launch directly, skipping setup (use this while developing)
 ./venv/bin/python3 -m py_compile wavestack.py   # syntax check; the only automated check available
@@ -20,6 +21,7 @@ A 1990s-styled, offline-first MP3 player for Linux desktops. Python 3 + classic 
 | File | Role |
 | --- | --- |
 | `wavestack.py` | Entire app: config, helpers, widgets, audio engine, main window, entry point |
+| `wavestack_art.py` | Procedural pixel-art painter for Wallpaper Mode; writes `assets/visuals/` |
 | `run.sh` | Cross-distro bootstrap (apt/dnf/pacman/zypper) + launcher; `exec`s the venv Python |
 | `requirements.txt` | `python-vlc`, `Pillow`, `mutagen`, `requests`, `numpy` |
 | `WaveStack.desktop` | Checked-in launcher with a hardcoded absolute path; `run.sh` generates the real one |
@@ -71,6 +73,8 @@ Top to bottom, separated by `# ----` banner comments:
 **Theme icon.** `ThemeIcon` (a small `tk.Canvas` at the right end of the menu row, after File/Playback/Theme/Help). The menu row is a `Frame` of `Menubutton`s (`self.menubar`, `self._menubuttons`) rather than a native `tk.Menu` menubar, because a native one cannot hold widgets draws 16x16 pixel art per theme from `ICON_FRAMES` (`light` sun, `dark` moon, `hotdog` dripping hot dog, `mac_platinum` bobbing apple, `amber` the Flash running in place with lightning trailing behind). It animates only while playing and shows plain phase 0 otherwise; `_sync_vinyl_spin_state` drives it and `on_close` calls `shutdown()`. A new theme needs an `ICON_FRAMES` entry.
 
 **Equalizer.** The `Equalizer` button (between Audio Visualizer and the repeat/shuffle mode button) toggles `EqualizerWindow`, a themed non-modal `Toplevel` with Bass/Mid/Treble sliders (±12 dB). Sliders call `audio.set_eq(band, db)`. In the native engine, `AudioEngine.cpp` runs a miniaudio node graph (buffer source → low shelf 100 Hz → peak 1 kHz → high shelf 8 kHz); `set_bass/mid/treble` only write atomics and the audio thread glides the live gains 1 dB per callback (no pops). On libVLC it maps to the 10-band equalizer. Gains persist in `state.json` under `eq`. Rebuild the module after C++ edits with `./venv/bin/python3 setup.py build_ext --inplace`.
+
+**Wallpaper Mode.** The `Wallpaper` button (after Equalizer) toggles `WallpaperWindow`, a fullscreen canvas-only `Toplevel` (Esc closes) with fixed "hardware" colours. `get_song_visual_vibe` maps the AUTO-SORT genre (else the ID3 `TCON` tag) to a folder under `assets/visuals/` (`cyber_neon`, `industrial_grunge`, `midnight_dusk`, `default`). Art is 12 committed 320x180 PNGs per vibe painted by `wavestack_art.py` (separate module: numpy + Pillow scene painter with colour ramps and Bayer dithering; `./venv/bin/python3 wavestack_art.py --force` regenerates). `load_vibe_sources` paints any missing folder on demand; user PNGs dropped into a folder are used instead. `load_visual_script` reads `<track>.visuals.json` (`[{start_ms, end_ms, text, image}]`, or a `{"<ms>": {image, text} | [image, text]}` map; image is 1-based, a vibe filename, or a path relative to the track) or falls back to the `.lrc` (new picture on every lyric line, order shuffled per song), else loops images every `VISUAL_LOOP_MS`. A 15 ms `after` loop reads `audio.get_time_seconds()` and repaints only when the verse changes. Two looks, toggled with `G`: `color` (default) and `grime` (`grime_process`: grayscale → `GRIME_CONTRAST` → `ImageOps.colorize` black/`GRIME_COLOR` → 256-wide grid → screen, NEAREST only); `color` is `ImageEnhance.Contrast` + NEAREST cover-scaling. `_play_path` calls `load_track` on it, `on_close` shuts it down.
 
 **Layout.** `_build_widgets` packs, top to bottom, inside `outer_frame`: header, LCD marquee, transport row, seek row, volume row, then the status bar (`side=BOTTOM`), then `panes`. `panes` is a 3-column grid: library (search entry + tree listbox), middle column (AUTO-SORT/Enqueue/Remove/Clear + vinyl), right column (queue over lyrics, 50/50). `toggle_visualizer` swaps `panes` and `visualizer` with `pack_forget`/`pack`.
 
